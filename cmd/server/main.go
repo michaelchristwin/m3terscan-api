@@ -21,7 +21,7 @@ func main() {
 	defer api.Db.Close()
 
 	router.Use(cors.New(cors.Config{
-		AllowOrigins:     []string{"https://ap-dashboard-kappa.vercel.app", "https://m3terscan-rr.vercel.app", "http://localhost:5173", "https://m3terscan.m3ter.ing"},
+		AllowOrigins:     []string{"https://ap-dashboard-kappa.vercel.app", "https://m3terscan-rr.vercel.app", "http://localhost:5173", "https://m3terscan.m3ter.ing", "https://alliancepower.io", "https://explore.m3ter.ing"},
 		AllowMethods:     []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
 		AllowHeaders:     []string{"Origin", "Content-Type", "Authorization"},
 		ExposeHeaders:    []string{"Content-Length"},
@@ -42,6 +42,7 @@ func main() {
 		api.GetCommitState(ctx, client)
 	})
 	router.GET("m3ter/:id/activities", api.GetActivities)
+	router.GET("/m3ter/:id/current-week", api.GetCurrentWeek)
 
 	router.Run() // listens on 0.0.0.0:8080 by default
 }

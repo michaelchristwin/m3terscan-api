@@ -28,3 +28,8 @@ type StateResponse struct {
 	Account string   `json:"account"`
 	Nonce   *big.Int `json:"nonce"`
 }
+
+type CurrentWeekResponse struct {
+	DayOfWeek string `json:"dayOfWeek"`
+	Energy    int64  `json:"energy"`
+}

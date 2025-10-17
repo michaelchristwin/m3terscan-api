@@ -4,14 +4,11 @@ import (
 	"database/sql"
 	_ "embed"
 	"errors"
-	"fmt"
 	"log"
-	"m3terscan-api/internal/m3tering"
 	"m3terscan-api/internal/models"
 	"m3terscan-api/internal/tutorial"
 	"m3terscan-api/internal/util"
 	"math/big"
-	"strings"
 	"sync"
 
 	"github.com/ethereum/go-ethereum/accounts/abi"
@@ -30,31 +27,31 @@ var (
 //go:embed schema.sql
 var ddl string
 
-func init() {
-	var err error
-	parsedABI, err = abi.JSON(strings.NewReader(m3tering.M3teringABI))
-	if err != nil {
-		panic(fmt.Errorf("failed to parse ABI: %w", err))
-	}
-	Db, err = sql.Open("sqlite", "file:m3ters.db?_foreign_keys=on")
-	if err != nil {
-		log.Fatal(err)
+// func init() {
+// 	var err error
+// 	parsedABI, err = abi.JSON(strings.NewReader(m3tering.M3teringABI))
+// 	if err != nil {
+// 		panic(fmt.Errorf("failed to parse ABI: %w", err))
+// 	}
+// 	Db, err = sql.Open("sqlite", "file:m3ters.db?_foreign_keys=on")
+// 	if err != nil {
+// 		log.Fatal(err)
 
-	}
+// 	}
 
-	_, err = Db.Exec("PRAGMA journal_mode = WAL;")
-	if err != nil {
-		log.Fatal(err)
-	}
+// 	_, err = Db.Exec("PRAGMA journal_mode = WAL;")
+// 	if err != nil {
+// 		log.Fatal(err)
+// 	}
 
-	log.Println("WAL mode enabled")
-	initOnce.Do(func() {
-		if _, err := Db.Exec(ddl); err != nil {
-			log.Fatalf("failed to initialize schema: %v", err)
-		}
-		log.Println("Schema initialized successfully")
-	})
-}
+// 	log.Println("WAL mode enabled")
+// 	initOnce.Do(func() {
+// 		if _, err := Db.Exec(ddl); err != nil {
+// 			log.Fatalf("failed to initialize schema: %v", err)
+// 		}
+// 		log.Println("Schema initialized successfully")
+// 	})
+// }
 
 // GetCommitState godoc
 // @Summary      Get commit state for a transaction
