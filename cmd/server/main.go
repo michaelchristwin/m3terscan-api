@@ -41,7 +41,7 @@ func main() {
 	router.GET("/proposal", func(ctx *gin.Context) {
 		api.GetCommitState(ctx, client)
 	})
-	router.GET("m3ter/:id/activities", api.GetActivities)
+	router.GET("/m3ter/:id/activities", api.GetActivities)
 	router.GET("/m3ter/:id/current-week", api.GetCurrentWeek)
 
 	router.Run() // listens on 0.0.0.0:8080 by default

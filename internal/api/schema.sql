@@ -1,8 +1,8 @@
-CREATE TABLE proposals (
-    id TEXT PRIMARY KEY  -- hex string (e.g., "0xabc123...")
+CREATE TABLE IF NOT EXISTS proposals (
+    id TEXT PRIMARY KEY  
 );
 
-CREATE TABLE proposal_meters (
+CREATE TABLE IF NOT EXISTS proposal_meters (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     proposal_id TEXT NOT NULL,
     m3ter_no INTEGER NOT NULL,
