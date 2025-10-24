@@ -4,7 +4,6 @@ import (
 	"log"
 	"m3terscan-api/internal/api"
 	"m3terscan-api/internal/blockchain"
-	"time"
 
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
@@ -21,12 +20,9 @@ func main() {
 	defer api.Db.Close()
 
 	router.Use(cors.New(cors.Config{
-		AllowOrigins:     []string{"https://ap-dashboard-kappa.vercel.app", "https://m3terscan-rr.vercel.app", "http://localhost:5173", "https://m3terscan.m3ter.ing", "https://alliancepower.io", "https://explore.m3ter.ing"},
-		AllowMethods:     []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
-		AllowHeaders:     []string{"Origin", "Content-Type", "Authorization"},
-		ExposeHeaders:    []string{"Content-Length"},
-		AllowCredentials: true,
-		MaxAge:           12 * time.Hour,
+		AllowOrigins: []string{"*"}, //[]string{"https://ap-dashboard-kappa.vercel.app", "https://m3terscan-rr.vercel.app", "https://m3terscan.m3ter.ing", "https://alliancepower.io", "https://explore.m3ter.ing"}
+		AllowMethods: []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
+		AllowHeaders: []string{"*"},
 	}))
 	router.GET("/", func(c *gin.Context) {
 		c.JSON(200, gin.H{
