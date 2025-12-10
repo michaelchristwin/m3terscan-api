@@ -4,7 +4,7 @@ APIRouter module for m3ter endpoint.
 
 import datetime
 import calendar
-from datetime import timedelta, timezone
+from datetime import timezone, timedelta
 from typing import List
 import pandas as pd
 from gql import gql
@@ -34,10 +34,11 @@ async def get_daily(m3ter_id: int):
 
     # Difference in number of blocks since start of day
     min_block = int(height - (timestamp - start_of_day) / block_interval)
+    # min_block = latest_block.first_block_of_day(now.year, now.month, now.day)
     query = gql(
         """
-        query DailyQuery($meterNumber: Int!, $block: BlockFilter) {
-            meterDataPoints(meterNumber: $meterNumber, block: $block) {
+        query DailyQuery($meterNumber: Int!, $block: BlockFilter, $first: Int!) {
+            meterDataPoints(meterNumber: $meterNumber, block: $block, first: $first) {
                 node {
                     timestamp
                     payload {
@@ -51,11 +52,11 @@ async def get_daily(m3ter_id: int):
     query.variable_values = {
         "meterNumber": m3ter_id,
         "block": {"min": min_block, "max": height},
+        "first": 96,
     }
 
     result = await graphql.gql_query(query)
     meter_data_points = result.get("meterDataPoints", [])
-
     # 1. Extract and flatten the required fields
     flat_data = [
         {
@@ -353,7 +354,7 @@ async def get_month_of_year(
     max_block = min(min_block + interval_forward, height)
     query = gql(
         """
-        query DailyQuery($meterNumber: Int!, $block: BlockFilter) {
+        query Query($meterNumber: Int!, $block: BlockFilter) {
             meterDataPoints(meterNumber: $meterNumber, block: $block) {
                 node {
                     timestamp
