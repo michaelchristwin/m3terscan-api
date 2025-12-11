@@ -26,7 +26,7 @@ async def get_daily(m3ter_id: int):
     if timestamp.tzinfo is None:
         timestamp = timestamp.replace(tzinfo=timezone.utc)
 
-    now = datetime.datetime.now(timezone.utc)
+    now = datetime.datetime.now(tz=timezone.utc)
     start_of_day = datetime.datetime(
         year=now.year, month=now.month, day=now.day, tzinfo=timezone.utc
     )
@@ -34,42 +34,66 @@ async def get_daily(m3ter_id: int):
 
     # Difference in number of blocks since start of day
     min_block = int(height - (timestamp - start_of_day) / block_interval)
-    # min_block = latest_block.first_block_of_day(now.year, now.month, now.day)
-    query = gql(
-        """
-        query DailyQuery($meterNumber: Int!, $block: BlockFilter, $first: Int!) {
-            meterDataPoints(meterNumber: $meterNumber, block: $block, first: $first) {
+
+    async def fetch_page(cursor: str | None = None):
+        variables = {
+            "meterNumber": m3ter_id,
+            "block": {"min": min_block, "max": height},
+            "first": 500,
+            "sortBy": "HEIGHT_ASC",
+            "after": None,
+        }
+        if cursor:
+            variables["after"] = cursor
+
+        query = gql(
+            """
+        query DailyQuery($meterNumber: Int!, 
+                         $block: BlockFilter, 
+                         $first: Int!, 
+                         $sortBy: MeterDataPointOrderBy,
+                         $after: String) {
+              meterDataPoints(meterNumber: $meterNumber, 
+                            block: $block, 
+                            first: $first, 
+                            sortBy: $sortBy,
+                            after: $after) {
                 node {
                     timestamp
                     payload {
                         energy
                     }
                 }
+                cursor
             }
         }
         """
-    )
-    query.variable_values = {
-        "meterNumber": m3ter_id,
-        "block": {"min": min_block, "max": height},
-        "first": 96,
-    }
+        )
+        query.variable_values = variables
+        result = await graphql.gql_query(query)
+        items = result.get("meterDataPoints", [])
 
-    result = await graphql.gql_query(query)
-    meter_data_points = result.get("meterDataPoints", [])
-    # 1. Extract and flatten the required fields
-    flat_data = [
-        {
-            "timestamp": item["node"]["timestamp"],
-            "energy": item["node"]["payload"]["energy"],
-        }
-        for item in meter_data_points
-    ]
+        return [
+            {
+                "timestamp": i["node"]["timestamp"],
+                "energy": i["node"]["payload"]["energy"],
+                "cursor": i["cursor"],
+            }
+            for i in items
+        ]
 
-    # Handle the empty array case:
-    if not flat_data:
-        # Create a full 24-hour UTC index for a default date (e.g., today's date)
-        # We need a starting date to generate the ISO strings. Using the current time.
+    all_flat_data = []
+    cursor = None
+
+    while True:
+        page = await fetch_page(cursor)
+
+        if not page:
+            break
+        all_flat_data.extend(page)
+        cursor = page[-1]["cursor"]
+
+    if not all_flat_data:
         now_utc = pd.Timestamp.now(tz="UTC").normalize()
         full_index = pd.date_range(start=now_utc, periods=24, freq="h", tz="UTC")
 
@@ -80,50 +104,41 @@ async def get_daily(m3ter_id: int):
             }
             for ts in full_index
         ]
+    start_of_day_utc = datetime.datetime.now(tz=timezone.utc).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    end_of_day_utc = start_of_day_utc + datetime.timedelta(days=1)
 
-    # 2. Create DataFrame and convert millisecond timestamp to UTC datetime
-    df = pd.DataFrame(flat_data)
+    start_ms = int(start_of_day_utc.timestamp() * 1000)
+    end_ms = int(end_of_day_utc.timestamp() * 1000)
 
-    # CRITICAL: Convert ms to datetime, localize it to UTC immediately.
+    # Sanitize: keep only today's data
+    all_flat_data = [
+        item for item in all_flat_data if start_ms <= item["timestamp"] < end_ms
+    ]
+
+    df = pd.DataFrame(all_flat_data)
     df["datetime_utc"] = pd.to_datetime(df["timestamp"], unit="ms").dt.tz_localize(
         "UTC"
     )
-
-    # 3. Set the datetime column as the index for resampling
     df = df.set_index("datetime_utc")
 
-    # 4. Resample to Hourly (H) frequency, aggregate by sum, and fill missing hours with 0
-    # .resample('H') groups data into precise hourly bins.
-    # .sum() aggregates the energy within that bin.
-    # .fillna(0.0) ensures every hour has a value.
-    hourly_aggregation = df["energy"].resample("h").sum().fillna(0.0)
+    hourly = df["energy"].resample("h").sum()
 
-    # 5. Handle all 24 hours (Reindexing to a fixed 24-hour period)
-    # This step ensures the output array is exactly 24 items, covering a full day
-    # relative to the first piece of data.
-
-    # Determine the start of the first day present in the data
-    start_of_day_utc = hourly_aggregation.index.min().floor("D")
-
-    # Create a continuous 24-hour index spanning that day (00:00:00 to 23:00:00)
+    start_of_day_utc = hourly.index.min().floor("D")
     full_day_index = pd.date_range(
         start=start_of_day_utc, periods=24, freq="h", tz="UTC"
     )
 
-    # Reindex the aggregation to fit the full 24-hour day
-    hourly_filled = hourly_aggregation.reindex(full_day_index, fill_value=0.0)
+    hourly = hourly.reindex(full_day_index, fill_value=0.0)
 
-    # 6. Format the output to a list of dictionaries with the ISO 8601 string
-    output_array = [
+    return [
         {
-            # Format as ISO 8601 string: YYYY-MM-DDTHH:MM:SSZ
             "hour_start_utc": ts.isoformat().replace("+00:00", "Z"),  # type: ignore
-            "total_energy": round(energy, 6),
+            "total_energy": float(energy),
         }
-        for ts, energy in hourly_filled.items()
+        for ts, energy in hourly.items()
     ]
-
-    return output_array
 
 
 @m3ter_router.get("/weekly", response_model=List[output.WeeklyResponse])
