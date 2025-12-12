@@ -13,7 +13,6 @@ async def gql_query(query: GraphQLRequest):
     transport = AIOHTTPTransport(url="https://subgraph.m3ter.ing/v2")
 
     async with Client(
-        transport=transport,
-        fetch_schema_from_transport=True,
+        transport=transport, fetch_schema_from_transport=True, execute_timeout=1000
     ) as client:
         return await client.execute(query)

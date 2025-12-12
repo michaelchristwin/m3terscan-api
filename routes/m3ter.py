@@ -305,76 +305,115 @@ async def get_weeks_of_year(m3ter_id: int, year: int):
     # --- Special case: current year → cap at current height ---
     if year == current_year:
         max_block = height
-    query = gql(
-        """
-        query DailyQuery($meterNumber: Int!, $block: BlockFilter) {
-            meterDataPoints(meterNumber: $meterNumber, block: $block) {
+
+    async def fetch_page(cursor: str | None = None):
+        variables = {
+            "meterNumber": m3ter_id,
+            "block": {"min": min_block, "max": max_block},
+            "first": 5000,
+            "sortBy": "HEIGHT_ASC",
+            "after": None,
+        }
+        if cursor:
+            variables["after"] = cursor
+        query = gql(
+            """
+        query WeeklyQuery($meterNumber: Int!, 
+                         $block: BlockFilter,
+                         $first: Int!, 
+                         $sortBy: MeterDataPointOrderBy,
+                         $after: String) {
+        meterDataPoints(meterNumber: $meterNumber,
+                         block: $block,
+                         first: $first, 
+                         sortBy: $sortBy,
+                         after: $after) {
                 node {
                     timestamp
                     payload {
                         energy
                     }
                 }
+                cursor
             }
         }
         """
-    )
-    query.variable_values = {
-        "meterNumber": m3ter_id,
-        "block": {"min": min_block, "max": max_block},
-    }
+        )
+        query.variable_values = variables
+        result = await graphql.gql_query(query)
+        items = result.get("meterDataPoints", [])
 
-    result = await graphql.gql_query(query)
-    meter_data_points = result.get("meterDataPoints", [])
+        return [
+            {
+                "timestamp": i["node"]["timestamp"],
+                "energy": i["node"]["payload"]["energy"],
+                "cursor": i["cursor"],
+            }
+            for i in items
+        ]
 
-    # 1. Extract and flatten the required fields
-    flat_data = [
-        {
-            "timestamp": item["node"]["timestamp"],
-            "energy": item["node"]["payload"]["energy"],
-        }
-        for item in meter_data_points
-    ]
+    all_flat_data = []
+    cursor = None
+    loop = 0
+
+    while True:
+        page = await fetch_page(cursor)
+
+        if not page:
+            break
+        all_flat_data.extend(page)
+        loop += 1
+        cursor = page[-1]["cursor"]
 
     # Handle the empty array case:
-    if not flat_data:
-        # If empty, assume the current year (2025) which has 52 weeks.
+    if not all_flat_data:
         return [{"week": i, "total_energy": 0.0} for i in range(1, 53)]
 
-    # 2. Create DataFrame and convert ms timestamp to UTC datetime
-    df = pd.DataFrame(flat_data)
+    # 1. Define the start of the target calendar year (Jan 1st, 00:00:00.000)
+    start_of_year_utc = datetime.datetime(year, 1, 1, tzinfo=timezone.utc)
+
+    # 2. Define the start of the next calendar year (Jan 1st, 00:00:00.000)
+    end_of_year_utc = datetime.datetime(year + 1, 1, 1, tzinfo=timezone.utc)
+
+    # 3. Convert boundary times to milliseconds for comparison
+    start_ms = int(start_of_year_utc.timestamp() * 1000)
+    end_ms = int(end_of_year_utc.timestamp() * 1000)
+
+    # 4. Sanitize: keep only data within the target calendar year [start_ms, end_ms)
+    all_flat_data = [
+        item for item in all_flat_data if start_ms <= item["timestamp"] < end_ms
+    ]
+
+    # Re-check for empty data after filtering
+    if not all_flat_data:
+        # Check total weeks for correct range in case of a 53-week year
+        dec28 = datetime.date(year, 12, 28)
+        total_weeks = dec28.isocalendar()[1]
+        return [{"week": i, "total_energy": 0.0} for i in range(1, total_weeks + 1)]
+
+    df = pd.DataFrame(all_flat_data)
     df["datetime_utc"] = pd.to_datetime(df["timestamp"], unit="ms").dt.tz_localize(
         "UTC"
     )
 
-    # 3. Extract the ISO week number (1 to 52/53) and Year
     df["iso_week"] = df["datetime_utc"].dt.isocalendar().week  # type: ignore
     df["year"] = df["datetime_utc"].dt.year  # type:ignore
 
-    # 4. Group by year and week number and sum the energy
     weekly_aggregation = df.groupby(["year", "iso_week"])["energy"].sum().reset_index()
 
-    # --- Step 5: Determine the full week index for the specific year ---
-
-    # Use the year of the last timestamp as the target year for the full array length
     target_year = df["datetime_utc"].max().year
 
-    # Robustly calculate total weeks: Dec 28th is guaranteed to be in the last week (52 or 53)
     last_week_day = pd.Timestamp(f"{target_year}-12-28", tz="UTC")
     total_weeks = last_week_day.isocalendar()[1]
 
-    # Create a full index of weeks (1 to total_weeks)
     full_weeks_index = pd.Index(range(1, total_weeks + 1), name="iso_week")
 
-    # Filter the aggregation to only include the target year's weeks
     yearly_agg = weekly_aggregation[
         weekly_aggregation["year"] == target_year
     ].set_index("iso_week")
 
-    # 6. Reindex and fill missing weeks with 0.0
     weekly_filled = yearly_agg["energy"].reindex(full_weeks_index, fill_value=0.0)
 
-    # 7. Format the output to a list of dictionaries
     output_array = [
         {"week": week, "total_energy": round(energy, 6)}
         for week, energy in weekly_filled.items()
@@ -392,65 +431,121 @@ async def get_month_of_year(
     month: int,
 ):
     """
-    Get energy usage of a month in specified year.
-
-     :param m3ter_id: Description
-     :type m3ter_id: int
-     :param year: Description
-     :type year: int
-     :param month: Description
-     :type month: int
+    Get energy usage of a month in a specified year using pagination and timestamp filtering.
     """
     height, _ = latest_block.get_latest_block()
     today = datetime.date.today()
     target = datetime.date(year, month, 1)
-    interval = (target - today).days * 720
-    min_block = height - interval
+
+    # --- BLOCK RANGE ESTIMATION (For initial GraphQL fetch) ---
+    # This range is just a safeguard; the timestamp filter is the precise boundary.
+    blocks_per_day = 720
     last_day = calendar.monthrange(year, month)[1]
-    interval_forward = (last_day - 1) * 720
-    max_block = min(min_block + interval_forward, height)
-    query = gql(
-        """
-        query Query($meterNumber: Int!, $block: BlockFilter) {
-            meterDataPoints(meterNumber: $meterNumber, block: $block) {
+
+    # Estimate the difference in days from today to the start of the target month
+    days_diff_to_start = (today - target).days
+    min_block = height - (days_diff_to_start * blocks_per_day)
+
+    # Estimate the difference in blocks for the duration of the month
+    blocks_in_month = last_day * blocks_per_day
+
+    # Max block is the minimum of the estimated end block or the current chain height
+    max_block = min(min_block + blocks_in_month, height)
+
+    # --- PAGINATION LOGIC ---
+
+    async def fetch_page(cursor: str | None = None):
+        """Fetches a page of data from the GraphQL endpoint."""
+        variables = {
+            "meterNumber": m3ter_id,
+            "block": {"min": min_block, "max": max_block},
+            "first": 2000,  # Set as requested
+            "sortBy": "HEIGHT_ASC",
+            "after": cursor,
+        }
+
+        # Note: Added $first, $sortBy, and $after variables to the query definition
+        query = gql(
+            """
+        query MonthQuery($meterNumber: Int!, 
+                         $block: BlockFilter,
+                         $first: Int!, 
+                         $sortBy: MeterDataPointOrderBy,
+                         $after: String) {
+        meterDataPoints(meterNumber: $meterNumber,
+                         block: $block,
+                         first: $first, 
+                         sortBy: $sortBy,
+                         after: $after) {
                 node {
                     timestamp
                     payload {
                         energy
                     }
                 }
+                cursor
             }
         }
         """
-    )
-    query.variable_values = {
-        "meterNumber": m3ter_id,
-        "block": {"min": min_block, "max": max_block},
-    }
+        )
+        query.variable_values = variables
+        result = await graphql.gql_query(query)
+        items = result.get("meterDataPoints", [])
 
-    result = await graphql.gql_query(query)
-    meter_data_points = result.get("meterDataPoints", [])
+        # Flatten data and include the cursor for the next iteration
+        return [
+            {
+                "timestamp": i["node"]["timestamp"],
+                "energy": i["node"]["payload"]["energy"],
+                "cursor": i["cursor"],
+            }
+            for i in items
+        ]
+
+    all_flat_data = []
+    cursor = None
+
+    while True:
+        page = await fetch_page(cursor)
+
+        if not page:
+            break
+        all_flat_data.extend(page)
+        cursor = page[-1][
+            "cursor"
+        ]  # Use the cursor of the last item for the next fetch
+
+    # --- FILTERING BY CALENDAR MONTH (UTC) ---
+
+    # 1. Define the start of the target month (1st of month, 00:00:00.000 UTC)
+    start_of_month_utc = datetime.datetime(year, month, 1, tzinfo=timezone.utc)
+
+    # 2. Define the start of the next month (1st of next month, 00:00:00.000 UTC)
+    if month == 12:
+        end_of_month_utc = datetime.datetime(year + 1, 1, 1, tzinfo=timezone.utc)
+    else:
+        end_of_month_utc = datetime.datetime(year, month + 1, 1, tzinfo=timezone.utc)
+
+    # 3. Convert boundary times to milliseconds for comparison
+    start_ms = int(start_of_month_utc.timestamp() * 1000)
+    end_ms = int(end_of_month_utc.timestamp() * 1000)
+
+    # 4. Sanitize: keep only data within the target calendar month [start_ms, end_ms)
+    all_flat_data = [
+        item for item in all_flat_data if start_ms <= item["timestamp"] < end_ms
+    ]
 
     # ------------------------------------------------------------------
     # 3. PANDAS AGGREGATION AND ZERO-FILLING
     # ------------------------------------------------------------------
 
-    # Extract and flatten the required fields
-    flat_data = [
-        {
-            "timestamp": item["node"]["timestamp"],
-            "energy": item["node"]["payload"]["energy"],
-        }
-        for item in meter_data_points
-    ]
-
-    # Handle the empty array case:
-    if not flat_data:
+    # Re-check for empty data after filtering:
+    if not all_flat_data:
         # If empty, return an array of 0 energy for every day in the month
         return [{"day": i, "total_energy": 0.0} for i in range(1, last_day + 1)]
 
     # Create DataFrame and convert ms timestamp to UTC datetime
-    df = pd.DataFrame(flat_data)
+    df = pd.DataFrame(all_flat_data)
     df["datetime_utc"] = pd.to_datetime(df["timestamp"], unit="ms").dt.tz_localize(
         "UTC"
     )
