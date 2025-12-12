@@ -149,63 +149,105 @@ async def get_weekly(m3ter_id: int):
     height, _ = latest_block.get_latest_block()
     interval = datetime.datetime.now().weekday() * 720
     min_block = height - interval
-    query = gql(
-        """
-        query DailyQuery($meterNumber: Int!, $block: BlockFilter) {
-            meterDataPoints(meterNumber: $meterNumber, block: $block) {
+
+    async def fetch_page(cursor: str | None = None):
+        variables = {
+            "meterNumber": m3ter_id,
+            "block": {"min": min_block, "max": height},
+            "first": 1000,
+            "sortBy": "HEIGHT_ASC",
+            "after": None,
+        }
+        if cursor:
+            variables["after"] = cursor
+        query = gql(
+            """
+        query WeeklyQuery($meterNumber: Int!, 
+                         $block: BlockFilter,
+                         $first: Int!, 
+                         $sortBy: MeterDataPointOrderBy,
+                         $after: String) {
+        meterDataPoints(meterNumber: $meterNumber,
+                         block: $block,
+                         first: $first, 
+                         sortBy: $sortBy,
+                         after: $after) {
                 node {
                     timestamp
                     payload {
                         energy
                     }
                 }
+                cursor
             }
         }
         """
-    )
-    query.variable_values = {
-        "meterNumber": m3ter_id,
-        "block": {"min": min_block, "max": height},
-    }
+        )
+        query.variable_values = variables
+        result = await graphql.gql_query(query)
+        items = result.get("meterDataPoints", [])
 
-    result = await graphql.gql_query(query)
+        return [
+            {
+                "timestamp": i["node"]["timestamp"],
+                "energy": i["node"]["payload"]["energy"],
+                "cursor": i["cursor"],
+            }
+            for i in items
+        ]
 
-    meter_data_points = result.get("meterDataPoints", [])
+    all_flat_data = []
+    cursor = None
 
-    # 1. Extract and flatten the required fields
-    flat_data = [
-        {
-            "timestamp": item["node"]["timestamp"],
-            "energy": item["node"]["payload"]["energy"],
-        }
-        for item in meter_data_points
-    ]
+    while True:
+        page = await fetch_page(cursor)
+
+        if not page:
+            break
+        all_flat_data.extend(page)
+        cursor = page[-1]["cursor"]
 
     # Handle the empty array case:
-    if not flat_data:
-        # If no data points, return 7 days of 0 energy immediately.
+    if not all_flat_data:
+
         return [{"day_of_week": i, "total_energy": 0.0} for i in range(7)]
 
-    # 2. Create DataFrame and convert millisecond timestamp to datetime
-    df = pd.DataFrame(flat_data)
+    now_utc = datetime.datetime.now(tz=timezone.utc)
 
-    # CRITICAL: Convert ms to datetime, localize it to UTC for consistency.
+    # 2. Calculate the start of the current week (Monday at 00:00:00 UTC)
+    # The .weekday() method returns 0 for Monday and 6 for Sunday.
+    days_since_monday = now_utc.weekday()
+    start_of_week_utc = (now_utc - datetime.timedelta(days=days_since_monday)).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+
+    # 3. Calculate the end of the current week (The first millisecond of next Monday)
+    end_of_week_utc = start_of_week_utc + datetime.timedelta(weeks=1)
+
+    # 4. Convert boundary times to milliseconds for comparison
+    start_ms = int(start_of_week_utc.timestamp() * 1000)
+    end_ms = int(end_of_week_utc.timestamp() * 1000)
+
+    # 5. Sanitize: keep only data within the current UTC week [start_ms, end_ms)
+    all_flat_data = [
+        item for item in all_flat_data if start_ms <= item["timestamp"] < end_ms
+    ]
+    if not all_flat_data:
+        return [{"day_of_week": i, "total_energy": 0.0} for i in range(7)]
+
+    df = pd.DataFrame(all_flat_data)
+
     df["datetime_utc"] = pd.to_datetime(df["timestamp"], unit="ms").dt.tz_localize(
         "UTC"
     )
 
-    # 3. Extract the day of the week: Monday=0, Sunday=6
     df["day_of_week"] = df["datetime_utc"].dt.dayofweek  # type: ignore
 
-    # 4. Group by day of the week and sum the energy
-    # The result is a Pandas Series indexed by the day number (0 to 6)
     daily_aggregation = df.groupby("day_of_week")["energy"].sum()
 
-    # 5. Reindex to include all 7 days (0 to 6) and fill missing values with 0
     full_days = pd.Index(range(7), name="day_of_week")
     daily_filled = daily_aggregation.reindex(full_days, fill_value=0.0)
 
-    # 6. Format the output to a list of dictionaries
     output_array = [
         {
             # Note: 0=Mon, 6=Sun
