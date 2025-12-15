@@ -12,6 +12,7 @@ from fastapi import APIRouter
 from utils import latest_block
 from models import output
 from config import graphql
+from handlers import daily
 
 
 m3ter_router = APIRouter(prefix="/m3ter/{m3ter_id}")
@@ -22,123 +23,13 @@ async def get_daily(m3ter_id: int):
     """
     Get daily energy usage aggregate.
     """
-    height, timestamp = latest_block.get_latest_block()
-    if timestamp.tzinfo is None:
-        timestamp = timestamp.replace(tzinfo=timezone.utc)
-
-    now = datetime.datetime.now(tz=timezone.utc)
-    start_of_day = datetime.datetime(
-        year=now.year, month=now.month, day=now.day, tzinfo=timezone.utc
-    )
-    block_interval = timedelta(minutes=2)
-
-    # Difference in number of blocks since start of day
-    min_block = int(height - (timestamp - start_of_day) / block_interval)
-
-    async def fetch_page(cursor: str | None = None):
-        variables = {
-            "meterNumber": m3ter_id,
-            "block": {"min": min_block, "max": height},
-            "first": 500,
-            "sortBy": "HEIGHT_ASC",
-            "after": None,
-        }
-        if cursor:
-            variables["after"] = cursor
-
-        query = gql(
-            """
-        query DailyQuery($meterNumber: Int!, 
-                         $block: BlockFilter, 
-                         $first: Int!, 
-                         $sortBy: MeterDataPointOrderBy,
-                         $after: String) {
-              meterDataPoints(meterNumber: $meterNumber, 
-                            block: $block, 
-                            first: $first, 
-                            sortBy: $sortBy,
-                            after: $after) {
-                node {
-                    timestamp
-                    payload {
-                        energy
-                    }
-                }
-                cursor
-            }
-        }
-        """
-        )
-        query.variable_values = variables
-        result = await graphql.gql_query(query)
-        items = result.get("meterDataPoints", [])
-
-        return [
-            {
-                "timestamp": i["node"]["timestamp"],
-                "energy": i["node"]["payload"]["energy"],
-                "cursor": i["cursor"],
-            }
-            for i in items
-        ]
-
-    all_flat_data = []
-    cursor = None
-
-    while True:
-        page = await fetch_page(cursor)
-
-        if not page:
-            break
-        all_flat_data.extend(page)
-        cursor = page[-1]["cursor"]
-
-    if not all_flat_data:
-        now_utc = pd.Timestamp.now(tz="UTC").normalize()
-        full_index = pd.date_range(start=now_utc, periods=24, freq="h", tz="UTC")
-
-        return [
-            {
-                "hour_start_utc": ts.isoformat().replace("+00:00", "Z"),
-                "total_energy": 0.0,
-            }
-            for ts in full_index
-        ]
-    start_of_day_utc = datetime.datetime.now(tz=timezone.utc).replace(
-        hour=0, minute=0, second=0, microsecond=0
-    )
-    end_of_day_utc = start_of_day_utc + datetime.timedelta(days=1)
-
-    start_ms = int(start_of_day_utc.timestamp() * 1000)
-    end_ms = int(end_of_day_utc.timestamp() * 1000)
-
-    # Sanitize: keep only today's data
-    all_flat_data = [
-        item for item in all_flat_data if start_ms <= item["timestamp"] < end_ms
-    ]
-
-    df = pd.DataFrame(all_flat_data)
-    df["datetime_utc"] = pd.to_datetime(df["timestamp"], unit="ms").dt.tz_localize(
-        "UTC"
-    )
-    df = df.set_index("datetime_utc")
-
-    hourly = df["energy"].resample("h").sum()
-
-    start_of_day_utc = hourly.index.min().floor("D")
-    full_day_index = pd.date_range(
-        start=start_of_day_utc, periods=24, freq="h", tz="UTC"
-    )
-
-    hourly = hourly.reindex(full_day_index, fill_value=0.0)
-
-    return [
-        {
-            "hour_start_utc": ts.isoformat().replace("+00:00", "Z"),  # type: ignore
-            "total_energy": float(energy),
-        }
-        for ts, energy in hourly.items()
-    ]
+    try:
+        return await daily.get_daily_with_cache(m3ter_id)
+    except Exception as e:
+        # Log the cache error
+        print(f"Cache error: {e}. Falling back to non-cached version.")
+        # Fall back to original implementation
+        return await daily.get_daily_without_cache(m3ter_id)
 
 
 @m3ter_router.get("/weekly", response_model=List[output.WeeklyResponse])
