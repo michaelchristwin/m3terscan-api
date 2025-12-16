@@ -2,11 +2,22 @@
 Project entry point for m3terscan API.
 """
 
+from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from routes import m3ter, proposal
+from config import valkey_client
 
-app = FastAPI()
+
+@asynccontextmanager
+async def lifespan(application: FastAPI):
+    """
+    Docstring for lifespan
+    """
+    application.title = "M3terscan API"
+    await valkey_client.get_client()
+    yield
+
 
 origins = [
     "http://localhost:5174",
@@ -17,6 +28,8 @@ origins = [
     "https://explore.m3ter.ing",
     "https://m3terscan-rr.vercel.app",
 ]
+
+app = FastAPI(lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,

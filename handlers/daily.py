@@ -1,5 +1,5 @@
 """
-Route handler a helper functions for daily endpoint.
+Route handler and helper functions for daily endpoint.
 """
 
 import datetime
@@ -9,7 +9,7 @@ import pandas as pd
 from glide import GlideClient, Batch, ExpiryType, ExpirySet
 from gql import gql
 from utils import latest_block
-from config import valkey
+from config import valkey_client
 from config import graphql
 
 
@@ -68,14 +68,10 @@ class EnergyDataCache:
         for hour, energy in hourly_data.items():
             key = self._cache_key(m3ter_id, date_str, hour)
 
-            # CORRECTED: Use the 'set' method with the 'expire_time' parameter.
-            # This is the modern, idiomatic replacement for SETEX in Glide.
             batch.set(
                 key=key,
                 value=str(energy),
                 expiry=ExpirySet(value=self.cache_ttl, expiry_type=ExpiryType.SEC),
-                # NX (Set if Not eXists) or XX (Set if eXists) can be added here if needed
-                # write_option=WriteOptions.ONLY_IF_EXISTS
             )
 
         # Execute the batch
@@ -214,7 +210,7 @@ class GraphQLDataFetcher:
                     )
 
             return filtered_items
-        except Exception:
+        except RuntimeError:
             return []
 
     def _aggregate_by_hour(
@@ -254,8 +250,8 @@ async def get_daily_with_cache(m3ter_id: int):
     Get daily energy usage aggregate with caching for completed hours.
     """
     # Initialize managers
-    valkey_client = await valkey.get_client()
-    cache_manager = EnergyDataCache(valkey_client)
+    vc = await valkey_client.get_client()
+    cache_manager = EnergyDataCache(vc)
     time_manager = TimeBoundaryManager()
 
     # Get time boundaries

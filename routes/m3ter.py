@@ -3,17 +3,18 @@ APIRouter module for m3ter endpoint.
 """
 
 import datetime
+import json
 import calendar
-from datetime import timezone, timedelta
+from datetime import timezone
 from typing import List
 import pandas as pd
 from gql import gql
+from glide import ExpirySet, ExpiryType
 from fastapi import APIRouter
 from utils import latest_block
 from models import output
-from config import graphql
+from config import graphql, valkey_client
 from handlers import daily
-
 
 m3ter_router = APIRouter(prefix="/m3ter/{m3ter_id}")
 
@@ -25,7 +26,7 @@ async def get_daily(m3ter_id: int):
     """
     try:
         return await daily.get_daily_with_cache(m3ter_id)
-    except Exception as e:
+    except RuntimeError as e:
         # Log the cache error
         print(f"Cache error: {e}. Falling back to non-cached version.")
         # Fall back to original implementation
@@ -155,37 +156,40 @@ async def get_weekly(m3ter_id: int):
 async def get_weeks_of_year(m3ter_id: int, year: int):
     """
     Get energy usage of all weeks of specified year.
-
-     :param m3ter_id: Description
-     :type m3ter_id: int
-     :param year: Description
-     :type year: int
     """
+    genesis_year = 2025
+    if year < genesis_year:
+        raise ValueError(f"No data exists before {genesis_year}")
+    vc = await valkey_client.get_client()
+
+    cache_key = f"energy:{m3ter_id}:weeks:{year}"
+
+    current_year = datetime.datetime.now(timezone.utc).year
+
+    # ---- 1. Try cache (safe for past years, acceptable for current year) ----
+    cached = await vc.get(cache_key)
+    if cached:
+        return json.loads(cached)
+
+    # ---- 2. Original computation logic (unchanged) ----
     height, _ = latest_block.get_latest_block()
     today = datetime.date.today()
-    current_year = datetime.datetime.now(
-        timezone.utc
-    ).year  # or today.year if you prefer local
 
     blocks_per_week = 5040  # 720 blocks/day * 7
 
     if year > current_year:
         raise ValueError("Cannot calculate future year blocks")
 
-    # --- Calculate total weeks in the target year ---
     if year == current_year:
-        # Current year: only count completed weeks so far
-        weeks_in_year = today.isocalendar()[1]  # ISO week number
+        weeks_in_year = today.isocalendar()[1]
     else:
-        # Past full year: use the reliable Dec 28 trick
         dec28 = datetime.date(year, 12, 28)
-        weeks_in_year = dec28.isocalendar()[1]  # always 52 or 53
+        weeks_in_year = dec28.isocalendar()[1]
 
     total_blocks_in_year = weeks_in_year * blocks_per_week
-
-    # --- Calculate blocks from previous years ---
     blocks_before_year = 0
-    for y in range(2024, year):  # assuming genesis/start 2024, adjust if needed
+
+    for y in range(genesis_year, year):
         dec28 = datetime.date(y, 12, 28)
         weeks = dec28.isocalendar()[1]
         blocks_before_year += weeks * blocks_per_week
@@ -193,7 +197,6 @@ async def get_weeks_of_year(m3ter_id: int, year: int):
     min_block = blocks_before_year + 1
     max_block = blocks_before_year + total_blocks_in_year
 
-    # --- Special case: current year → cap at current height ---
     if year == current_year:
         max_block = height
 
@@ -203,36 +206,36 @@ async def get_weeks_of_year(m3ter_id: int, year: int):
             "block": {"min": min_block, "max": max_block},
             "first": 5000,
             "sortBy": "HEIGHT_ASC",
-            "after": None,
+            "after": cursor,
         }
-        if cursor:
-            variables["after"] = cursor
+
         query = gql(
             """
-        query WeeklyQuery($meterNumber: Int!, 
-                         $block: BlockFilter,
-                         $first: Int!, 
-                         $sortBy: MeterDataPointOrderBy,
-                         $after: String) {
-        meterDataPoints(meterNumber: $meterNumber,
-                         block: $block,
-                         first: $first, 
-                         sortBy: $sortBy,
-                         after: $after) {
+            query WeeklyQuery(
+              $meterNumber: Int!,
+              $block: BlockFilter,
+              $first: Int!,
+              $sortBy: MeterDataPointOrderBy,
+              $after: String
+            ) {
+              meterDataPoints(
+                meterNumber: $meterNumber,
+                block: $block,
+                first: $first,
+                sortBy: $sortBy,
+                after: $after
+              ) {
                 node {
-                    timestamp
-                    payload {
-                        energy
-                    }
+                  timestamp
+                  payload { energy }
                 }
                 cursor
+              }
             }
-        }
-        """
+            """
         )
         query.variable_values = variables
         result = await graphql.gql_query(query)
-        items = result.get("meterDataPoints", [])
 
         return [
             {
@@ -240,77 +243,72 @@ async def get_weeks_of_year(m3ter_id: int, year: int):
                 "energy": i["node"]["payload"]["energy"],
                 "cursor": i["cursor"],
             }
-            for i in items
+            for i in result.get("meterDataPoints", [])
         ]
 
     all_flat_data = []
     cursor = None
-    loop = 0
 
     while True:
         page = await fetch_page(cursor)
-
         if not page:
             break
         all_flat_data.extend(page)
-        loop += 1
         cursor = page[-1]["cursor"]
 
-    # Handle the empty array case:
     if not all_flat_data:
-        return [{"week": i, "total_energy": 0.0} for i in range(1, 53)]
-
-    # 1. Define the start of the target calendar year (Jan 1st, 00:00:00.000)
-    start_of_year_utc = datetime.datetime(year, 1, 1, tzinfo=timezone.utc)
-
-    # 2. Define the start of the next calendar year (Jan 1st, 00:00:00.000)
-    end_of_year_utc = datetime.datetime(year + 1, 1, 1, tzinfo=timezone.utc)
-
-    # 3. Convert boundary times to milliseconds for comparison
-    start_ms = int(start_of_year_utc.timestamp() * 1000)
-    end_ms = int(end_of_year_utc.timestamp() * 1000)
-
-    # 4. Sanitize: keep only data within the target calendar year [start_ms, end_ms)
-    all_flat_data = [
-        item for item in all_flat_data if start_ms <= item["timestamp"] < end_ms
-    ]
-
-    # Re-check for empty data after filtering
-    if not all_flat_data:
-        # Check total weeks for correct range in case of a 53-week year
         dec28 = datetime.date(year, 12, 28)
         total_weeks = dec28.isocalendar()[1]
-        return [{"week": i, "total_energy": 0.0} for i in range(1, total_weeks + 1)]
+        data_output = [
+            {"week": i, "total_energy": 0.0} for i in range(1, total_weeks + 1)
+        ]
 
-    df = pd.DataFrame(all_flat_data)
-    df["datetime_utc"] = pd.to_datetime(df["timestamp"], unit="ms").dt.tz_localize(
-        "UTC"
-    )
+    else:
+        start_of_year_utc = datetime.datetime(year, 1, 1, tzinfo=timezone.utc)
+        end_of_year_utc = datetime.datetime(year + 1, 1, 1, tzinfo=timezone.utc)
 
-    df["iso_week"] = df["datetime_utc"].dt.isocalendar().week  # type: ignore
-    df["year"] = df["datetime_utc"].dt.year  # type:ignore
+        start_ms = int(start_of_year_utc.timestamp() * 1000)
+        end_ms = int(end_of_year_utc.timestamp() * 1000)
 
-    weekly_aggregation = df.groupby(["year", "iso_week"])["energy"].sum().reset_index()
+        all_flat_data = [
+            d for d in all_flat_data if start_ms <= d["timestamp"] < end_ms
+        ]
 
-    target_year = df["datetime_utc"].max().year
+        df = pd.DataFrame(all_flat_data)
+        df["datetime_utc"] = pd.to_datetime(df["timestamp"], unit="ms").dt.tz_localize(
+            "UTC"
+        )
+        df["iso_week"] = df["datetime_utc"].dt.isocalendar().week  # type:ignore
+        df["year"] = df["datetime_utc"].dt.year  # type:ignore
 
-    last_week_day = pd.Timestamp(f"{target_year}-12-28", tz="UTC")
-    total_weeks = last_week_day.isocalendar()[1]
+        weekly = df.groupby(["year", "iso_week"])["energy"].sum().reset_index()
 
-    full_weeks_index = pd.Index(range(1, total_weeks + 1), name="iso_week")
+        dec28 = datetime.date(year, 12, 28)
+        total_weeks = dec28.isocalendar()[1]
 
-    yearly_agg = weekly_aggregation[
-        weekly_aggregation["year"] == target_year
-    ].set_index("iso_week")
+        full_index = pd.Index(range(1, total_weeks + 1), name="iso_week")
 
-    weekly_filled = yearly_agg["energy"].reindex(full_weeks_index, fill_value=0.0)
+        yearly = weekly[weekly["year"] == year].set_index("iso_week")
+        filled = yearly["energy"].reindex(full_index, fill_value=0.0)
 
-    output_array = [
-        {"week": week, "total_energy": round(energy, 6)}
-        for week, energy in weekly_filled.items()
-    ]
+        data_output = [
+            {"week": int(week), "total_energy": round(float(energy), 6)}  # type:ignore
+            for week, energy in filled.items()
+        ]
 
-    return output_array
+    # ---- 3. Store in cache ----
+    # Past years are immutable → cache forever
+    if year < current_year:
+        await vc.set(cache_key, json.dumps(data_output))
+    else:
+        # Current year → still useful, but allow expiry
+        await vc.set(
+            cache_key,
+            json.dumps(data_output),
+            expiry=ExpirySet(value=(6 * 3600), expiry_type=ExpiryType.SEC),
+        )
+
+    return data_output
 
 
 @m3ter_router.get(
