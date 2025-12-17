@@ -2,19 +2,19 @@
 APIRouter module for m3ter endpoint.
 """
 
-import datetime
 import json
+import datetime
 import calendar
-from datetime import timezone
 from typing import List
-import pandas as pd
+from datetime import timezone
+from collections import defaultdict
 from gql import gql
-from glide import ExpirySet, ExpiryType
 from fastapi import APIRouter
-from utils import latest_block
+from glide import ExpirySet, ExpiryType
 from models import output
-from config import graphql, valkey_client
 from handlers import daily
+from utils import latest_block
+from config import graphql, valkey_client
 
 m3ter_router = APIRouter(prefix="/m3ter/{m3ter_id}")
 
@@ -27,9 +27,7 @@ async def get_daily(m3ter_id: int):
     try:
         return await daily.get_daily_with_cache(m3ter_id)
     except RuntimeError as e:
-        # Log the cache error
         print(f"Cache error: {e}. Falling back to non-cached version.")
-        # Fall back to original implementation
         return await daily.get_daily_without_cache(m3ter_id)
 
 
@@ -126,19 +124,16 @@ async def get_weekly(m3ter_id: int):
     ]
     if not all_flat_data:
         return [{"day_of_week": i, "total_energy": 0.0} for i in range(7)]
+    daily_energy = defaultdict(float)
 
-    df = pd.DataFrame(all_flat_data)
+    for row in all_flat_data:
+        # timestamp is in ms
+        dt = datetime.datetime.fromtimestamp(row["timestamp"] / 1000, tz=timezone.utc)
+        day_of_week = dt.weekday()  # 0 = Monday, 6 = Sunday
+        daily_energy[day_of_week] += row["energy"]
 
-    df["datetime_utc"] = pd.to_datetime(df["timestamp"], unit="ms").dt.tz_localize(
-        "UTC"
-    )
-
-    df["day_of_week"] = df["datetime_utc"].dt.dayofweek  # type: ignore
-
-    daily_aggregation = df.groupby("day_of_week")["energy"].sum()
-
-    full_days = pd.Index(range(7), name="day_of_week")
-    daily_filled = daily_aggregation.reindex(full_days, fill_value=0.0)
+    # ensure all 7 days exist
+    daily_filled = {day: daily_energy.get(day, 0.0) for day in range(7)}
 
     output_array = [
         {
@@ -161,9 +156,7 @@ async def get_weeks_of_year(m3ter_id: int, year: int):
     if year < genesis_year:
         raise ValueError(f"No data exists before {genesis_year}")
     vc = await valkey_client.get_client()
-
     cache_key = f"energy:{m3ter_id}:weeks:{year}"
-
     current_year = datetime.datetime.now(timezone.utc).year
 
     # ---- 1. Try cache (safe for past years, acceptable for current year) ----
@@ -274,26 +267,24 @@ async def get_weeks_of_year(m3ter_id: int, year: int):
             d for d in all_flat_data if start_ms <= d["timestamp"] < end_ms
         ]
 
-        df = pd.DataFrame(all_flat_data)
-        df["datetime_utc"] = pd.to_datetime(df["timestamp"], unit="ms").dt.tz_localize(
-            "UTC"
-        )
-        df["iso_week"] = df["datetime_utc"].dt.isocalendar().week  # type:ignore
-        df["year"] = df["datetime_utc"].dt.year  # type:ignore
+        weekly_energy = defaultdict(float)
 
-        weekly = df.groupby(["year", "iso_week"])["energy"].sum().reset_index()
+        for row in all_flat_data:
+            dt = datetime.datetime.fromtimestamp(
+                row["timestamp"] / 1000, tz=timezone.utc
+            )
+            iso_year, iso_week, _ = dt.isocalendar()  # returns (year, week, weekday)
+            if iso_year == year:
+                weekly_energy[iso_week] += row["energy"]
 
+        # Determine total weeks in the year
         dec28 = datetime.date(year, 12, 28)
         total_weeks = dec28.isocalendar()[1]
 
-        full_index = pd.Index(range(1, total_weeks + 1), name="iso_week")
-
-        yearly = weekly[weekly["year"] == year].set_index("iso_week")
-        filled = yearly["energy"].reindex(full_index, fill_value=0.0)
-
+        # Fill missing weeks with 0.0
         data_output = [
-            {"week": int(week), "total_energy": round(float(energy), 6)}  # type:ignore
-            for week, energy in filled.items()
+            {"week": w, "total_energy": round(float(weekly_energy.get(w, 0.0)), 6)}
+            for w in range(1, total_weeks + 1)
         ]
 
     # ---- 3. Store in cache ----
@@ -322,9 +313,21 @@ async def get_month_of_year(
     """
     Get energy usage of a month in a specified year using pagination and timestamp filtering.
     """
+    genesis_year = 2025
+    if year < genesis_year:
+        raise ValueError(f"No data exists before {genesis_year}")
+
+    vc = await valkey_client.get_client()
+    cache_key = f"energy:{m3ter_id}:month:{year}:{month}"
+    cached = await vc.get(cache_key)
+    if cached:
+        return json.loads(cached)
     height, _ = latest_block.get_latest_block()
     today = datetime.date.today()
     target = datetime.date(year, month, 1)
+    if target > today.replace(day=1):
+        raise ValueError("Future month not allowed")
+    current_year = datetime.datetime.now(timezone.utc).year
 
     # --- BLOCK RANGE ESTIMATION (For initial GraphQL fetch) ---
     # This range is just a safeguard; the timestamp filter is the precise boundary.
@@ -334,6 +337,7 @@ async def get_month_of_year(
     # Estimate the difference in days from today to the start of the target month
     days_diff_to_start = (today - target).days
     min_block = height - (days_diff_to_start * blocks_per_day)
+    min_block = max(1, min_block)
 
     # Estimate the difference in blocks for the duration of the month
     blocks_in_month = last_day * blocks_per_day
@@ -425,38 +429,38 @@ async def get_month_of_year(
     ]
 
     # ------------------------------------------------------------------
-    # 3. PANDAS AGGREGATION AND ZERO-FILLING
+    # 3. AGGREGATION AND ZERO-FILLING
     # ------------------------------------------------------------------
 
     # Re-check for empty data after filtering:
     if not all_flat_data:
         # If empty, return an array of 0 energy for every day in the month
-        return [{"day": i, "total_energy": 0.0} for i in range(1, last_day + 1)]
+        output_array = [{"day": i, "total_energy": 0.0} for i in range(1, last_day + 1)]
+        return output_array
 
-    # Create DataFrame and convert ms timestamp to UTC datetime
-    df = pd.DataFrame(all_flat_data)
-    df["datetime_utc"] = pd.to_datetime(df["timestamp"], unit="ms").dt.tz_localize(
-        "UTC"
-    )
+    daily_energy = defaultdict(float)
 
-    # Extract the day of the month (1 to 31)
-    df["day_of_month"] = df["datetime_utc"].dt.day  # type: ignore
+    for row in all_flat_data:
+        dt = datetime.datetime.fromtimestamp(row["timestamp"] / 1000, tz=timezone.utc)
+        day = dt.day  # 1 to 31
+        daily_energy[day] += row["energy"]
 
-    # Group by the day of the month and sum the energy
-    daily_aggregation = df.groupby("day_of_month")["energy"].sum()
-
-    # Create a full index of days (1 to total_days: 28, 29, 30, or 31)
-    full_days_index = pd.Index(range(1, last_day + 1), name="day_of_month")
-
-    # Reindex and fill missing days with 0.0
-    daily_filled = daily_aggregation.reindex(full_days_index, fill_value=0.0)
-
-    # Format the output to a list of dictionaries
+    # Fill all days of the month
     output_array = [
-        {"day": day, "total_energy": round(energy, 6)}
-        for day, energy in daily_filled.items()
+        {"day": day, "total_energy": round(float(daily_energy.get(day, 0.0)), 6)}
+        for day in range(1, last_day + 1)
     ]
 
+    # Create DataFrame and convert ms timestamp to UTC datetime
+    if year < current_year:
+        await vc.set(cache_key, json.dumps(output_array))
+    else:
+        # Current year → still useful, but allow expiry
+        await vc.set(
+            cache_key,
+            json.dumps(output_array),
+            expiry=ExpirySet(value=(6 * 3600), expiry_type=ExpiryType.SEC),
+        )
     return output_array
 
 

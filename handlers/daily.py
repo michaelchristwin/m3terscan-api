@@ -3,14 +3,13 @@ Route handler and helper functions for daily endpoint.
 """
 
 import datetime
+from collections import defaultdict
 from datetime import timedelta, timezone
 from typing import Dict, List, Optional, Tuple, Sequence
-import pandas as pd
 from glide import GlideClient, Batch, ExpiryType, ExpirySet
 from gql import gql
 from utils import latest_block
-from config import valkey_client
-from config import graphql
+from config import valkey_client, graphql
 
 
 class EnergyDataCache:
@@ -224,23 +223,20 @@ class GraphQLDataFetcher:
         if not data:
             return {hour: 0.0 for hour in range(start_hour, end_hour)}
 
-        df = pd.DataFrame(data)
-        df["datetime_utc"] = pd.to_datetime(df["timestamp"], unit="ms").dt.tz_localize(
-            "UTC"
-        )
-        df = df.set_index("datetime_utc")
+        hourly_energy = defaultdict(float)
 
-        # Resample by hour and sum energy
-        hourly = df["energy"].resample("h").sum()
+        for row in data:
+            dt = datetime.datetime.fromtimestamp(
+                row["timestamp"] / 1000, tz=timezone.utc
+            )
+            hour_dt = dt.replace(minute=0, second=0, microsecond=0)
+            hourly_energy[hour_dt] += row["energy"]
 
-        # Create result dictionary for the requested hour range
         result = {}
+
         for hour in range(start_hour, end_hour):
             hour_time = start_of_day + timedelta(hours=hour)
-            if hour_time in hourly.index:
-                result[hour] = float(hourly[hour_time])
-            else:
-                result[hour] = 0.0
+            result[hour] = float(hourly_energy.get(hour_time, 0.0))
 
         return result
 
@@ -437,16 +433,17 @@ async def get_daily_without_cache(m3ter_id: int):
 
     while True:
         page = await fetch_page(cursor)
-
         if not page:
             break
         all_flat_data.extend(page)
         cursor = page[-1]["cursor"]
 
+    # If no data, return zeroed hours
     if not all_flat_data:
-        now_utc = pd.Timestamp.now(tz="UTC").normalize()
-        full_index = pd.date_range(start=now_utc, periods=24, freq="h", tz="UTC")
-
+        now_utc = datetime.datetime.now(tz=timezone.utc).replace(
+            minute=0, second=0, microsecond=0
+        )
+        full_index = [now_utc.replace(hour=h) for h in range(24)]
         return [
             {
                 "hour_start_utc": ts.isoformat().replace("+00:00", "Z"),
@@ -454,38 +451,38 @@ async def get_daily_without_cache(m3ter_id: int):
             }
             for ts in full_index
         ]
+
+    # Compute start and end of the day in UTC
     start_of_day_utc = datetime.datetime.now(tz=timezone.utc).replace(
         hour=0, minute=0, second=0, microsecond=0
     )
-    end_of_day_utc = start_of_day_utc + datetime.timedelta(days=1)
+    end_of_day_utc = start_of_day_utc + timedelta(days=1)
 
-    start_ms = int(start_of_day_utc.timestamp() * 1000)
-    end_ms = int(end_of_day_utc.timestamp() * 1000)
-
-    # Sanitize: keep only today's data
+    # Filter today's data
     all_flat_data = [
-        item for item in all_flat_data if start_ms <= item["timestamp"] < end_ms
+        item
+        for item in all_flat_data
+        if start_of_day_utc.timestamp() * 1000
+        <= item["timestamp"]
+        < end_of_day_utc.timestamp() * 1000
     ]
 
-    df = pd.DataFrame(all_flat_data)
-    df["datetime_utc"] = pd.to_datetime(df["timestamp"], unit="ms").dt.tz_localize(
-        "UTC"
-    )
-    df = df.set_index("datetime_utc")
+    # Aggregate energy per hour
+    hourly_energy = defaultdict(float)
+    for item in all_flat_data:
+        dt = datetime.datetime.fromtimestamp(item["timestamp"] / 1000, tz=timezone.utc)
+        hour_dt = dt.replace(minute=0, second=0, microsecond=0)
+        hourly_energy[hour_dt] += item["energy"]
 
-    hourly = df["energy"].resample("h").sum()
+    # Fill all 24 hours
+    result = []
+    for h in range(24):
+        hour_start = start_of_day_utc + timedelta(hours=h)
+        result.append(
+            {
+                "hour_start_utc": hour_start.isoformat().replace("+00:00", "Z"),
+                "total_energy": float(hourly_energy.get(hour_start, 0.0)),
+            }
+        )
 
-    start_of_day_utc = hourly.index.min().floor("D")
-    full_day_index = pd.date_range(
-        start=start_of_day_utc, periods=24, freq="h", tz="UTC"
-    )
-
-    hourly = hourly.reindex(full_day_index, fill_value=0.0)
-
-    return [
-        {
-            "hour_start_utc": ts.isoformat().replace("+00:00", "Z"),  # type: ignore
-            "total_energy": float(energy),
-        }
-        for ts, energy in hourly.items()
-    ]
+    return result
