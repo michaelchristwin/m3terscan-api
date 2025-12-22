@@ -246,7 +246,7 @@ async def get_daily_with_cache(m3ter_id: int):
     Get daily energy usage aggregate with caching for completed hours.
     """
     # Initialize managers
-    vc = await valkey_client.get_client()
+    vc = valkey_client.ValkeyManager.get_client()
     cache_manager = EnergyDataCache(vc)
     time_manager = TimeBoundaryManager()
 
