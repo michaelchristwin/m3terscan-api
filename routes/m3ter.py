@@ -155,7 +155,7 @@ async def get_weeks_of_year(m3ter_id: int, year: int):
     genesis_year = 2025
     if year < genesis_year:
         raise ValueError(f"No data exists before {genesis_year}")
-    vc = await valkey_client.get_client()
+    vc = valkey_client.ValkeyManager.get_client()
     cache_key = f"energy:{m3ter_id}:weeks:{year}"
     current_year = datetime.datetime.now(timezone.utc).year
 
@@ -317,7 +317,7 @@ async def get_month_of_year(
     if year < genesis_year:
         raise ValueError(f"No data exists before {genesis_year}")
 
-    vc = await valkey_client.get_client()
+    vc = valkey_client.ValkeyManager.get_client()
     cache_key = f"energy:{m3ter_id}:month:{year}:{month}"
     cached = await vc.get(cache_key)
     if cached:

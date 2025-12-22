@@ -15,8 +15,9 @@ async def lifespan(application: FastAPI):
     Docstring for lifespan
     """
     application.title = "M3terscan API"
-    await valkey_client.get_client()
+    await valkey_client.ValkeyManager.init()
     yield
+    await valkey_client.ValkeyManager.close()
 
 
 origins = [
