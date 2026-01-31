@@ -242,20 +242,15 @@ class GraphQLDataFetcher:
 
 
 async def get_daily_with_cache(m3ter_id: int):
-    """
-    Get daily energy usage aggregate with caching for completed hours.
-    """
-    # Initialize managers
+    """Get daily energy usage aggregate with caching for completed hours."""
     vc = valkey_client.ValkeyManager.get_client()
     cache_manager = EnergyDataCache(vc)
     time_manager = TimeBoundaryManager()
 
-    # Get time boundaries
     now_utc = time_manager.get_current_utc_time()
-    date_str, current_hour, all_hours = time_manager.get_date_hour_info(now_utc)
+    date_str, current_hour, _ = time_manager.get_date_hour_info(now_utc)
     completed_hours = time_manager.get_completed_hours(current_hour)
 
-    # Step 1: Get block information (same as original)
     height, timestamp = latest_block.get_latest_block()
     if timestamp.tzinfo is None:
         timestamp = timestamp.replace(tzinfo=timezone.utc)
@@ -267,7 +262,7 @@ async def get_daily_with_cache(m3ter_id: int):
     block_interval = timedelta(minutes=2)
     min_block = int(height - (timestamp - start_of_day) / block_interval)
 
-    # Step 2: Check cache for completed hours
+    # Cached data for completed hours only
     cached_data = {}
     missing_hours = []
 
@@ -275,78 +270,58 @@ async def get_daily_with_cache(m3ter_id: int):
         cached_data = await cache_manager.get_hourly_cache_batch(
             m3ter_id, date_str, completed_hours
         )
+        missing_hours = [h for h in completed_hours if cached_data[h] is None]
 
-        # Identify hours missing from cache
-        missing_hours = [hour for hour in completed_hours if cached_data[hour] is None]
+    result: Dict[int, float] = {}
 
-    # Step 3: Prepare result dictionary
-    result: Dict[int, Optional[float]] = {hour: None for hour in all_hours}
+    # Add cached values
+    for hour, energy in cached_data.items():
+        if energy is not None:
+            result[hour] = energy
 
-    # Step 4: Add cached values to result
-    for hour in completed_hours:
-        if cached_data[hour] is not None:
-            result[hour] = cached_data[hour]
-
-    # Step 5: Handle future hours (beyond current hour) - always 0.0
-    for hour in range(current_hour + 1, 24):
-        result[hour] = 0.0
-
-    # Step 6: Fetch missing and current hour data
-    fresh_data = {}
+    # Determine hours to fetch (missing completed + current hour)
     hours_to_fetch = []
-
-    # Add missing completed hours
     if missing_hours:
         hours_to_fetch.extend(missing_hours)
-
-    # Always fetch current hour fresh
     hours_to_fetch.append(current_hour)
+
+    fresh_data = {}
 
     if hours_to_fetch:
         fetcher = GraphQLDataFetcher(m3ter_id, height, min_block)
 
-        # Group contiguous hours for efficient fetching
-        hours_to_fetch.sort()
+        hours_to_fetch = sorted(set(hours_to_fetch))
         hour_ranges = []
-        start = hours_to_fetch[0]
-        end = hours_to_fetch[0]
+        start = end = hours_to_fetch[0]
 
         for hour in hours_to_fetch[1:]:
             if hour == end + 1:
                 end = hour
             else:
                 hour_ranges.append((start, end + 1))
-                start = hour
-                end = hour
+                start = end = hour
         hour_ranges.append((start, end + 1))
 
-        # Fetch data for each range
         for start_hour, end_hour in hour_ranges:
             range_data = await fetcher.fetch_hourly_data(start_hour, end_hour)
             fresh_data.update(range_data)
 
-    # Step 7: Update result with fresh data
+    # Merge fresh data
     for hour, energy in fresh_data.items():
         result[hour] = energy
 
-    # Step 8: Cache newly fetched completed hours (excluding current hour)
-    if fresh_data:
-        completed_fresh_data = {
-            hour: energy
-            for hour, energy in fresh_data.items()
-            if hour in completed_hours
-        }
-        if completed_fresh_data:
-            await cache_manager.set_hourly_cache_batch(
-                m3ter_id, date_str, completed_fresh_data
-            )
+    # Cache newly completed hours only
+    completed_fresh_data = {
+        hour: energy for hour, energy in fresh_data.items() if hour in completed_hours
+    }
+    if completed_fresh_data:
+        await cache_manager.set_hourly_cache_batch(
+            m3ter_id, date_str, completed_fresh_data
+        )
 
-    # Step 9: Fill in any remaining None values with 0.0 (shouldn't happen but safety)
-    for hour in all_hours:
-        if result[hour] is None:
-            result[hour] = 0.0
+    if not result:
+        return []
 
-    # Step 10: Format and return result
     start_of_day_utc = datetime.datetime.now(tz=timezone.utc).replace(
         hour=0, minute=0, second=0, microsecond=0
     )
@@ -356,9 +331,9 @@ async def get_daily_with_cache(m3ter_id: int):
             "hour_start_utc": (start_of_day_utc + timedelta(hours=hour))
             .isoformat()
             .replace("+00:00", "Z"),
-            "total_energy": result[hour],
+            "total_energy": energy,
         }
-        for hour in all_hours
+        for hour, energy in sorted(result.items())
     ]
 
 
@@ -378,7 +353,6 @@ async def get_daily_without_cache(m3ter_id: int):
     )
     block_interval = timedelta(minutes=2)
 
-    # Difference in number of blocks since start of day
     min_block = int(height - (timestamp - start_of_day) / block_interval)
 
     async def fetch_page(cursor: str | None = None):
@@ -387,33 +361,35 @@ async def get_daily_without_cache(m3ter_id: int):
             "block": {"min": min_block, "max": height},
             "first": 500,
             "sortBy": "HEIGHT_ASC",
-            "after": None,
+            "after": cursor,
         }
-        if cursor:
-            variables["after"] = cursor
 
         query = gql(
             """
-        query DailyQuery($meterNumber: Int!, 
-                         $block: BlockFilter, 
-                         $first: Int!, 
-                         $sortBy: MeterDataPointOrderBy,
-                         $after: String) {
-              meterDataPoints(meterNumber: $meterNumber, 
-                            block: $block, 
-                            first: $first, 
-                            sortBy: $sortBy,
-                            after: $after) {
+            query DailyQuery(
+              $meterNumber: Int!,
+              $block: BlockFilter,
+              $first: Int!,
+              $sortBy: MeterDataPointOrderBy,
+              $after: String
+            ) {
+              meterDataPoints(
+                meterNumber: $meterNumber,
+                block: $block,
+                first: $first,
+                sortBy: $sortBy,
+                after: $after
+              ) {
                 node {
-                    timestamp
-                    payload {
-                        energy
-                    }
+                  timestamp
+                  payload {
+                    energy
+                  }
                 }
                 cursor
+              }
             }
-        }
-        """
+            """
         )
         query.variable_values = variables
         result = await graphql.gql_query(query)
@@ -438,27 +414,15 @@ async def get_daily_without_cache(m3ter_id: int):
         all_flat_data.extend(page)
         cursor = page[-1]["cursor"]
 
-    # If no data, return zeroed hours
+    # No data → return empty list
     if not all_flat_data:
-        now_utc = datetime.datetime.now(tz=timezone.utc).replace(
-            minute=0, second=0, microsecond=0
-        )
-        full_index = [now_utc.replace(hour=h) for h in range(24)]
-        return [
-            {
-                "hour_start_utc": ts.isoformat().replace("+00:00", "Z"),
-                "total_energy": 0.0,
-            }
-            for ts in full_index
-        ]
+        return []
 
-    # Compute start and end of the day in UTC
     start_of_day_utc = datetime.datetime.now(tz=timezone.utc).replace(
         hour=0, minute=0, second=0, microsecond=0
     )
     end_of_day_utc = start_of_day_utc + timedelta(days=1)
 
-    # Filter today's data
     all_flat_data = [
         item
         for item in all_flat_data
@@ -467,22 +431,16 @@ async def get_daily_without_cache(m3ter_id: int):
         < end_of_day_utc.timestamp() * 1000
     ]
 
-    # Aggregate energy per hour
     hourly_energy = defaultdict(float)
     for item in all_flat_data:
         dt = datetime.datetime.fromtimestamp(item["timestamp"] / 1000, tz=timezone.utc)
         hour_dt = dt.replace(minute=0, second=0, microsecond=0)
         hourly_energy[hour_dt] += item["energy"]
 
-    # Fill all 24 hours
-    result = []
-    for h in range(24):
-        hour_start = start_of_day_utc + timedelta(hours=h)
-        result.append(
-            {
-                "hour_start_utc": hour_start.isoformat().replace("+00:00", "Z"),
-                "total_energy": float(hourly_energy.get(hour_start, 0.0)),
-            }
-        )
-
-    return result
+    return [
+        {
+            "hour_start_utc": hour.isoformat().replace("+00:00", "Z"),
+            "total_energy": float(energy),
+        }
+        for hour, energy in sorted(hourly_energy.items())
+    ]
