@@ -114,31 +114,28 @@ class GraphQLDataFetcher:
         self, start_hour: int, end_hour: int
     ) -> Dict[int, float]:
         """
-        Fetch energy data for a specific hour range
-        Returns: Dict of {hour: total_energy}
+        Func
         """
         now_utc = datetime.datetime.now(tz=timezone.utc)
         start_of_day = datetime.datetime(
-            year=now_utc.year, month=now_utc.month, day=now_utc.day, tzinfo=timezone.utc
+            year=now_utc.year,
+            month=now_utc.month,
+            day=now_utc.day,
+            tzinfo=timezone.utc,
         )
 
-        # Calculate timestamp boundaries for the hour range
         start_time = start_of_day + timedelta(hours=start_hour)
         end_time = start_of_day + timedelta(hours=end_hour)
 
         start_ms = int(start_time.timestamp() * 1000)
         end_ms = int(end_time.timestamp() * 1000)
 
-        # Fetch all data points for the time range
         all_flat_data = await self._fetch_paginated_data(start_ms, end_ms)
 
         if not all_flat_data:
-            return {hour: 0.0 for hour in range(start_hour, end_hour)}
+            return {}  # ✅ NOTHING, not zeros
 
-        # Process and aggregate by hour
-        return self._aggregate_by_hour(
-            all_flat_data, start_of_day, start_hour, end_hour
-        )
+        return self._aggregate_by_hour(all_flat_data)
 
     async def _fetch_paginated_data(self, start_ms: int, end_ms: int) -> List[dict]:
         """Fetch paginated data from GraphQL"""
@@ -212,33 +209,18 @@ class GraphQLDataFetcher:
         except RuntimeError:
             return []
 
-    def _aggregate_by_hour(
-        self,
-        data: List[dict],
-        start_of_day: datetime.datetime,
-        start_hour: int,
-        end_hour: int,
-    ) -> Dict[int, float]:
-        """Aggregate data by hour within the specified range"""
-        if not data:
-            return {hour: 0.0 for hour in range(start_hour, end_hour)}
-
+    def _aggregate_by_hour(self, data: List[dict]) -> Dict[int, float]:
         hourly_energy = defaultdict(float)
 
         for row in data:
             dt = datetime.datetime.fromtimestamp(
                 row["timestamp"] / 1000, tz=timezone.utc
             )
-            hour_dt = dt.replace(minute=0, second=0, microsecond=0)
-            hourly_energy[hour_dt] += row["energy"]
+            hour = dt.hour
+            hourly_energy[hour] += row["energy"]
 
-        result = {}
-
-        for hour in range(start_hour, end_hour):
-            hour_time = start_of_day + timedelta(hours=hour)
-            result[hour] = float(hourly_energy.get(hour_time, 0.0))
-
-        return result
+        # ✅ Return ONLY hours that exist
+        return dict(hourly_energy)
 
 
 async def get_daily_with_cache(m3ter_id: int):
@@ -254,81 +236,73 @@ async def get_daily_with_cache(m3ter_id: int):
     height, timestamp = latest_block.get_latest_block()
     if timestamp.tzinfo is None:
         timestamp = timestamp.replace(tzinfo=timezone.utc)
-
-    now = datetime.datetime.now(tz=timezone.utc)
+    # print("Max block: ", height)
     start_of_day = datetime.datetime(
-        year=now.year, month=now.month, day=now.day, tzinfo=timezone.utc
+        year=now_utc.year,
+        month=now_utc.month,
+        day=now_utc.day,
+        tzinfo=timezone.utc,
     )
     block_interval = timedelta(minutes=2)
     min_block = int(height - (timestamp - start_of_day) / block_interval)
+    # print("Min Block: ", min_block)
+    result: Dict[int, float] = {}
 
-    # Cached data for completed hours only
+    # --- Read cache (completed hours only, no defaults)
     cached_data = {}
-    missing_hours = []
-
     if completed_hours:
         cached_data = await cache_manager.get_hourly_cache_batch(
             m3ter_id, date_str, completed_hours
         )
-        missing_hours = [h for h in completed_hours if cached_data[h] is None]
 
-    result: Dict[int, float] = {}
+        for hour, energy in cached_data.items():
+            if energy is not None:
+                result[hour] = energy
 
-    # Add cached values
-    for hour, energy in cached_data.items():
-        if energy is not None:
-            result[hour] = energy
+    # --- Determine hours to fetch
+    missing_completed = [h for h in completed_hours if cached_data.get(h) is None]
 
-    # Determine hours to fetch (missing completed + current hour)
-    hours_to_fetch = []
-    if missing_hours:
-        hours_to_fetch.extend(missing_hours)
-    hours_to_fetch.append(current_hour)
+    hours_to_fetch = set(missing_completed)
+    hours_to_fetch.add(current_hour)
 
     fresh_data = {}
 
     if hours_to_fetch:
         fetcher = GraphQLDataFetcher(m3ter_id, height, min_block)
 
-        hours_to_fetch = sorted(set(hours_to_fetch))
-        hour_ranges = []
-        start = end = hours_to_fetch[0]
+        hours = sorted(hours_to_fetch)
+        ranges = []
+        start = end = hours[0]
 
-        for hour in hours_to_fetch[1:]:
-            if hour == end + 1:
-                end = hour
+        for h in hours[1:]:
+            if h == end + 1:
+                end = h
             else:
-                hour_ranges.append((start, end + 1))
-                start = end = hour
-        hour_ranges.append((start, end + 1))
+                ranges.append((start, end + 1))
+                start = end = h
+        ranges.append((start, end + 1))
 
-        for start_hour, end_hour in hour_ranges:
-            range_data = await fetcher.fetch_hourly_data(start_hour, end_hour)
-            fresh_data.update(range_data)
+        for start_hour, end_hour in ranges:
+            data = await fetcher.fetch_hourly_data(start_hour, end_hour)
+            fresh_data.update(data)
 
-    # Merge fresh data
+    # --- Merge fresh data
     for hour, energy in fresh_data.items():
         result[hour] = energy
 
-    # Cache newly completed hours only
-    completed_fresh_data = {
+    # --- Cache completed hours only
+    completed_fresh = {
         hour: energy for hour, energy in fresh_data.items() if hour in completed_hours
     }
-    if completed_fresh_data:
-        await cache_manager.set_hourly_cache_batch(
-            m3ter_id, date_str, completed_fresh_data
-        )
+    if completed_fresh:
+        await cache_manager.set_hourly_cache_batch(m3ter_id, date_str, completed_fresh)
 
     if not result:
         return []
 
-    start_of_day_utc = datetime.datetime.now(tz=timezone.utc).replace(
-        hour=0, minute=0, second=0, microsecond=0
-    )
-
     return [
         {
-            "hour_start_utc": (start_of_day_utc + timedelta(hours=hour))
+            "hour_start_utc": (start_of_day + timedelta(hours=hour))
             .isoformat()
             .replace("+00:00", "Z"),
             "total_energy": energy,
@@ -352,7 +326,6 @@ async def get_daily_without_cache(m3ter_id: int):
         year=now.year, month=now.month, day=now.day, tzinfo=timezone.utc
     )
     block_interval = timedelta(minutes=2)
-
     min_block = int(height - (timestamp - start_of_day) / block_interval)
 
     async def fetch_page(cursor: str | None = None):
@@ -382,9 +355,7 @@ async def get_daily_without_cache(m3ter_id: int):
               ) {
                 node {
                   timestamp
-                  payload {
-                    energy
-                  }
+                  payload { energy }
                 }
                 cursor
               }
@@ -406,7 +377,6 @@ async def get_daily_without_cache(m3ter_id: int):
 
     all_flat_data = []
     cursor = None
-
     while True:
         page = await fetch_page(cursor)
         if not page:
@@ -414,26 +384,24 @@ async def get_daily_without_cache(m3ter_id: int):
         all_flat_data.extend(page)
         cursor = page[-1]["cursor"]
 
-    # No data → return empty list
     if not all_flat_data:
         return []
 
-    start_of_day_utc = datetime.datetime.now(tz=timezone.utc).replace(
-        hour=0, minute=0, second=0, microsecond=0
-    )
+    start_of_day_utc = start_of_day
     end_of_day_utc = start_of_day_utc + timedelta(days=1)
 
-    all_flat_data = [
-        item
-        for item in all_flat_data
-        if start_of_day_utc.timestamp() * 1000
-        <= item["timestamp"]
-        < end_of_day_utc.timestamp() * 1000
-    ]
-
     hourly_energy = defaultdict(float)
+
     for item in all_flat_data:
-        dt = datetime.datetime.fromtimestamp(item["timestamp"] / 1000, tz=timezone.utc)
+        ts = item["timestamp"]
+        if not (
+            start_of_day_utc.timestamp() * 1000
+            <= ts
+            < end_of_day_utc.timestamp() * 1000
+        ):
+            continue
+
+        dt = datetime.datetime.fromtimestamp(ts / 1000, tz=timezone.utc)
         hour_dt = dt.replace(minute=0, second=0, microsecond=0)
         hourly_energy[hour_dt] += item["energy"]
 
