@@ -1,38 +1,60 @@
 """
-APIRouter module for m3ter endpoint.
+APIRouter module for meter endpoint.
 """
 
-import json
-import datetime
+import asyncio
 import calendar
-from typing import List
-from datetime import timezone
+import datetime
+import json
 from collections import defaultdict
-from gql import gql
-from fastapi import APIRouter
+from datetime import timezone
+from typing import Any, Dict, List
+
+from fastapi import APIRouter, Query
 from glide import ExpirySet, ExpiryType
-from models import output
-from handlers import daily
-from utils import latest_block
+from gql import gql
+
 from config import graphql, valkey_client
+from handlers import daily
+from models import output
+from utils import latest_block
 
-m3ter_router = APIRouter(prefix="/m3ter/{m3ter_id}")
+meter_router = APIRouter(prefix="/meter/{meter_id}")
 
 
-@m3ter_router.get("/daily", response_model=List[output.DailyResponse])
-async def get_daily(m3ter_id: int):
+@meter_router.get("/daily", response_model=List[output.DailyResponse])
+async def get_daily(meter_id: int):
     """
     Get daily energy usage aggregate.
     """
     try:
-        return await daily.get_daily_with_cache(m3ter_id)
+        return await daily.get_daily_with_cache(meter_id)
     except RuntimeError as e:
         print(f"Cache error: {e}. Falling back to non-cached version.")
-        return await daily.get_daily_without_cache(m3ter_id)
+        return await daily.get_daily_without_cache(meter_id)
 
 
-@m3ter_router.get("/weekly", response_model=List[output.WeeklyResponse])
-async def get_weekly(m3ter_id: int):
+@meter_router.get("/daily-batch")
+async def get_daily_batch(
+    meter_ids: List[int] = Query(
+        ..., description="Repeat param: ?meter_ids=1&meter_ids=2"
+    ),
+) -> Dict[str, Any]:
+    """
+    Get daily Batch
+    """
+
+    async def run_one(meter_id: int):
+        data = await daily.get_daily_with_cache(meter_id)
+        return meter_id, data
+
+    results = await asyncio.gather(*(run_one(mid) for mid in meter_ids))
+
+    return {str(meter_id): data for meter_id, data in results}
+
+
+@meter_router.get("/weekly", response_model=List[output.WeeklyResponse])
+async def get_weekly(meter_id: int):
     """
     Get weekly energy usage aggregate.
     """
@@ -42,7 +64,7 @@ async def get_weekly(m3ter_id: int):
 
     async def fetch_page(cursor: str | None = None):
         variables = {
-            "meterNumber": m3ter_id,
+            "meterNumber": meter_id,
             "block": {"min": min_block, "max": height},
             "first": 1000,
             "sortBy": "HEIGHT_ASC",
@@ -52,14 +74,14 @@ async def get_weekly(m3ter_id: int):
             variables["after"] = cursor
         query = gql(
             """
-        query WeeklyQuery($meterNumber: Int!, 
+        query WeeklyQuery($meterNumber: Int!,
                          $block: BlockFilter,
-                         $first: Int!, 
+                         $first: Int!,
                          $sortBy: MeterDataPointOrderBy,
                          $after: String) {
         meterDataPoints(meterNumber: $meterNumber,
                          block: $block,
-                         first: $first, 
+                         first: $first,
                          sortBy: $sortBy,
                          after: $after) {
                 node {
@@ -99,7 +121,6 @@ async def get_weekly(m3ter_id: int):
 
     # Handle the empty array case:
     if not all_flat_data:
-
         return [{"day_of_week": i, "total_energy": 0.0} for i in range(7)]
 
     now_utc = datetime.datetime.now(tz=timezone.utc)
@@ -147,55 +168,56 @@ async def get_weekly(m3ter_id: int):
     return output_array
 
 
-@m3ter_router.get("/weeks/{year}", response_model=List[output.WeeksOfYearResponse])
-async def get_weeks_of_year(m3ter_id: int, year: int):
+@meter_router.get("/weeks/{year}", response_model=List[output.WeeksOfYearResponse])
+async def get_weeks_of_year(meter_id: int, year: int):
     """
     Get energy usage of all weeks of specified year.
     """
     genesis_year = 2025
+    blocks_per_day = 720  # 1 block every 2 minutes
+
     if year < genesis_year:
         raise ValueError(f"No data exists before {genesis_year}")
-    vc = valkey_client.ValkeyManager.get_client()
-    cache_key = f"energy:{m3ter_id}:weeks:{year}"
-    current_year = datetime.datetime.now(timezone.utc).year
 
-    # ---- 1. Try cache (safe for past years, acceptable for current year) ----
-    cached = await vc.get(cache_key)
-    if cached:
-        return json.loads(cached)
-
-    # ---- 2. Original computation logic (unchanged) ----
-    height, _ = latest_block.get_latest_block()
-    today = datetime.date.today()
-
-    blocks_per_week = 5040  # 720 blocks/day * 7
+    now = datetime.datetime.now(timezone.utc)
+    current_year = now.year
 
     if year > current_year:
         raise ValueError("Cannot calculate future year blocks")
 
+    height, _ = latest_block.get_latest_block()
+
+    today = now.date()
+
+    # Start and end of requested year
+    start_of_year = datetime.date(year, 1, 1)
+
     if year == current_year:
-        weeks_in_year = today.isocalendar()[1]
+        end_of_year = today
     else:
-        dec28 = datetime.date(year, 12, 28)
-        weeks_in_year = dec28.isocalendar()[1]
+        end_of_year = datetime.date(year, 12, 31)
 
-    total_blocks_in_year = weeks_in_year * blocks_per_week
-    blocks_before_year = 0
+    # Days from start_of_requested_year to today
+    days_since_start = (today - start_of_year).days
 
-    for y in range(genesis_year, year):
-        dec28 = datetime.date(y, 12, 28)
-        weeks = dec28.isocalendar()[1]
-        blocks_before_year += weeks * blocks_per_week
-
-    min_block = blocks_before_year + 1
-    max_block = blocks_before_year + total_blocks_in_year
+    # Days in the requested year
+    days_in_year = (end_of_year - start_of_year).days + 1
 
     if year == current_year:
+        min_block = height - (days_since_start * blocks_per_day)
         max_block = height
+    else:
+        # Days between end of requested year and today
+        days_after_year = (today - end_of_year).days
+
+        max_block = height - (days_after_year * blocks_per_day)
+        min_block = max_block - (days_in_year * blocks_per_day)
+    print(f"Min Block: {min_block}")
+    print(f"Max Block: {max_block}")
 
     async def fetch_page(cursor: str | None = None):
         variables = {
-            "meterNumber": m3ter_id,
+            "meterNumber": meter_id,
             "block": {"min": min_block, "max": max_block},
             "first": 5000,
             "sortBy": "HEIGHT_ASC",
@@ -204,7 +226,7 @@ async def get_weeks_of_year(m3ter_id: int, year: int):
 
         query = gql(
             """
-            query WeeklyQuery(
+            query WeeksQuery(
               $meterNumber: Int!,
               $block: BlockFilter,
               $first: Int!,
@@ -287,26 +309,14 @@ async def get_weeks_of_year(m3ter_id: int, year: int):
             for w in range(1, total_weeks + 1)
         ]
 
-    # ---- 3. Store in cache ----
-    # Past years are immutable → cache forever
-    if year < current_year:
-        await vc.set(cache_key, json.dumps(data_output))
-    else:
-        # Current year → still useful, but allow expiry
-        await vc.set(
-            cache_key,
-            json.dumps(data_output),
-            expiry=ExpirySet(value=(6 * 3600), expiry_type=ExpiryType.SEC),
-        )
-
     return data_output
 
 
-@m3ter_router.get(
+@meter_router.get(
     "/month/{year}/{month}", response_model=List[output.MonthOfYearResponse]
 )
 async def get_month_of_year(
-    m3ter_id: int,
+    meter_id: int,
     year: int,
     month: int,
 ):
@@ -318,7 +328,7 @@ async def get_month_of_year(
         raise ValueError(f"No data exists before {genesis_year}")
 
     vc = valkey_client.ValkeyManager.get_client()
-    cache_key = f"energy:{m3ter_id}:month:{year}:{month}"
+    cache_key = f"energy:{meter_id}:month:{year}:{month}"
     cached = await vc.get(cache_key)
     if cached:
         return json.loads(cached)
@@ -350,7 +360,7 @@ async def get_month_of_year(
     async def fetch_page(cursor: str | None = None):
         """Fetches a page of data from the GraphQL endpoint."""
         variables = {
-            "meterNumber": m3ter_id,
+            "meterNumber": meter_id,
             "block": {"min": min_block, "max": max_block},
             "first": 2000,  # Set as requested
             "sortBy": "HEIGHT_ASC",
@@ -360,14 +370,14 @@ async def get_month_of_year(
         # Note: Added $first, $sortBy, and $after variables to the query definition
         query = gql(
             """
-        query MonthQuery($meterNumber: Int!, 
+        query MonthQuery($meterNumber: Int!,
                          $block: BlockFilter,
-                         $first: Int!, 
+                         $first: Int!,
                          $sortBy: MeterDataPointOrderBy,
                          $after: String) {
         meterDataPoints(meterNumber: $meterNumber,
                          block: $block,
-                         first: $first, 
+                         first: $first,
                          sortBy: $sortBy,
                          after: $after) {
                 node {
@@ -464,8 +474,8 @@ async def get_month_of_year(
     return output_array
 
 
-@m3ter_router.get("/activities", response_model=output.ActivitiesResponse)
-async def get_activities(m3ter_id: int, after: str | None = None, limit: int = 10):
+@meter_router.get("/activities", response_model=output.ActivitiesResponse)
+async def get_activities(meter_id: int, after: str | None = None, limit: int = 10):
     """
     Get activities of a m3ter
 
@@ -495,7 +505,7 @@ async def get_activities(m3ter_id: int, after: str | None = None, limit: int = 1
 			  }
 		    }"""
     )
-    query.variable_values = {"meterNumber": m3ter_id, "first": limit, " after": after}
+    query.variable_values = {"meterNumber": meter_id, "first": limit, " after": after}
 
     result = await graphql.gql_query(query)
     meter_data_points = result.get("meterDataPoints", [])

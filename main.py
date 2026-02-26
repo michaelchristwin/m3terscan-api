@@ -3,10 +3,12 @@ Project entry point for m3terscan API.
 """
 
 from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from routes import m3ter, proposal
+
 from config import valkey_client
+from routes import meter, proposal
 
 
 @asynccontextmanager
@@ -50,5 +52,5 @@ def read_root():
     return {"message": "Hello from the m3terscan API"}
 
 
-app.include_router(m3ter.m3ter_router)
+app.include_router(meter.meter_router)
 app.include_router(proposal.proposal_router)
