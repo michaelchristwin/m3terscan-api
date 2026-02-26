@@ -9,6 +9,11 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from config import valkey_client
 from routes import meter, proposal
+from sqlmodel import SQLModel
+from database import engine
+
+
+from models.weeks_of_year import WeeksEnergy
 
 
 @asynccontextmanager
@@ -17,6 +22,7 @@ async def lifespan(application: FastAPI):
     Docstring for lifespan
     """
     application.title = "M3terscan API"
+    SQLModel.metadata.create_all(engine)
     await valkey_client.ValkeyManager.init()
     yield
     await valkey_client.ValkeyManager.close()

@@ -13,16 +13,25 @@ from typing import Any, Dict, List
 from fastapi import APIRouter, Query
 from glide import ExpirySet, ExpiryType
 from gql import gql
+from sqlmodel import Session, select
 
 from config import graphql, valkey_client
+from database import engine
 from handlers import daily
-from models import output
+from models.output import (
+    ActivitiesResponse,
+    DailyResponse,
+    MonthOfYearResponse,
+    WeeklyResponse,
+)
+from models.weeks_of_year import WeeksEnergy
+from schemas.weeks_of_year import WeeksEnergyRead
 from utils import latest_block
 
 meter_router = APIRouter(prefix="/meter/{meter_id}")
 
 
-@meter_router.get("/daily", response_model=List[output.DailyResponse])
+@meter_router.get("/daily", response_model=List[DailyResponse])
 async def get_daily(meter_id: int):
     """
     Get daily energy usage aggregate.
@@ -53,7 +62,7 @@ async def get_daily_batch(
     return {str(meter_id): data for meter_id, data in results}
 
 
-@meter_router.get("/weekly", response_model=List[output.WeeklyResponse])
+@meter_router.get("/weekly", response_model=List[WeeklyResponse])
 async def get_weekly(meter_id: int):
     """
     Get weekly energy usage aggregate.
@@ -168,7 +177,7 @@ async def get_weekly(meter_id: int):
     return output_array
 
 
-@meter_router.get("/weeks/{year}", response_model=List[output.WeeksOfYearResponse])
+@meter_router.get("/weeks/{year}", response_model=List[WeeksEnergyRead])
 async def get_weeks_of_year(meter_id: int, year: int):
     """
     Get energy usage of all weeks of specified year.
@@ -184,137 +193,151 @@ async def get_weeks_of_year(meter_id: int, year: int):
 
     if year > current_year:
         raise ValueError("Cannot calculate future year blocks")
+    with Session(engine) as session:
+        statement = select(WeeksEnergy).where(WeeksEnergy.year == year)
+        results = session.exec(statement).all()
 
-    height, _ = latest_block.get_latest_block()
+        if not results:
+            height, _ = latest_block.get_latest_block()
 
-    today = now.date()
+            today = now.date()
 
-    # Start and end of requested year
-    start_of_year = datetime.date(year, 1, 1)
+            # Start and end of requested year
+            start_of_year = datetime.date(year, 1, 1)
 
-    if year == current_year:
-        end_of_year = today
-    else:
-        end_of_year = datetime.date(year, 12, 31)
+            if year == current_year:
+                end_of_year = today
+            else:
+                end_of_year = datetime.date(year, 12, 31)
 
-    # Days from start_of_requested_year to today
-    days_since_start = (today - start_of_year).days
+            # Days from start_of_requested_year to today
+            days_since_start = (today - start_of_year).days
 
-    # Days in the requested year
-    days_in_year = (end_of_year - start_of_year).days + 1
+            # Days in the requested year
+            days_in_year = (end_of_year - start_of_year).days + 1
 
-    if year == current_year:
-        min_block = height - (days_since_start * blocks_per_day)
-        max_block = height
-    else:
-        # Days between end of requested year and today
-        days_after_year = (today - end_of_year).days
+            if year == current_year:
+                min_block = height - (days_since_start * blocks_per_day)
+                max_block = height
+            else:
+                # Days between end of requested year and today
+                days_after_year = (today - end_of_year).days
 
-        max_block = height - (days_after_year * blocks_per_day)
-        min_block = max_block - (days_in_year * blocks_per_day)
-    print(f"Min Block: {min_block}")
-    print(f"Max Block: {max_block}")
+                max_block = height - (days_after_year * blocks_per_day)
+                min_block = max_block - (days_in_year * blocks_per_day)
+            print(f"Min Block: {min_block}")
+            print(f"Max Block: {max_block}")
 
-    async def fetch_page(cursor: str | None = None):
-        variables = {
-            "meterNumber": meter_id,
-            "block": {"min": min_block, "max": max_block},
-            "first": 5000,
-            "sortBy": "HEIGHT_ASC",
-            "after": cursor,
-        }
-
-        query = gql(
-            """
-            query WeeksQuery(
-              $meterNumber: Int!,
-              $block: BlockFilter,
-              $first: Int!,
-              $sortBy: MeterDataPointOrderBy,
-              $after: String
-            ) {
-              meterDataPoints(
-                meterNumber: $meterNumber,
-                block: $block,
-                first: $first,
-                sortBy: $sortBy,
-                after: $after
-              ) {
-                node {
-                  timestamp
-                  payload { energy }
+            async def fetch_page(cursor: str | None = None):
+                variables = {
+                    "meterNumber": meter_id,
+                    "block": {"min": min_block, "max": max_block},
+                    "first": 3000,
+                    "sortBy": "HEIGHT_ASC",
+                    "after": cursor,
                 }
-                cursor
-              }
-            }
-            """
-        )
-        query.variable_values = variables
-        result = await graphql.gql_query(query)
 
-        return [
-            {
-                "timestamp": i["node"]["timestamp"],
-                "energy": i["node"]["payload"]["energy"],
-                "cursor": i["cursor"],
-            }
-            for i in result.get("meterDataPoints", [])
-        ]
+                query = gql(
+                    """
+                    query WeeksQuery(
+                      $meterNumber: Int!,
+                      $block: BlockFilter,
+                      $first: Int!,
+                      $sortBy: MeterDataPointOrderBy,
+                      $after: String
+                    ) {
+                      meterDataPoints(
+                        meterNumber: $meterNumber,
+                        block: $block,
+                        first: $first,
+                        sortBy: $sortBy,
+                        after: $after
+                      ) {
+                        node {
+                          timestamp
+                          payload { energy }
+                        }
+                        cursor
+                      }
+                    }
+                    """
+                )
+                query.variable_values = variables
+                result = await graphql.gql_query(query)
 
-    all_flat_data = []
-    cursor = None
+                return [
+                    {
+                        "timestamp": i["node"]["timestamp"],
+                        "energy": i["node"]["payload"]["energy"],
+                        "cursor": i["cursor"],
+                    }
+                    for i in result.get("meterDataPoints", [])
+                ]
 
-    while True:
-        page = await fetch_page(cursor)
-        if not page:
-            break
-        all_flat_data.extend(page)
-        cursor = page[-1]["cursor"]
+            all_flat_data = []
+            cursor = None
 
-    if not all_flat_data:
-        dec28 = datetime.date(year, 12, 28)
-        total_weeks = dec28.isocalendar()[1]
-        data_output = [
-            {"week": i, "total_energy": 0.0} for i in range(1, total_weeks + 1)
-        ]
+            while True:
+                page = await fetch_page(cursor)
+                if not page:
+                    break
+                all_flat_data.extend(page)
+                cursor = page[-1]["cursor"]
 
-    else:
-        start_of_year_utc = datetime.datetime(year, 1, 1, tzinfo=timezone.utc)
-        end_of_year_utc = datetime.datetime(year + 1, 1, 1, tzinfo=timezone.utc)
+            if not all_flat_data:
+                dec28 = datetime.date(year, 12, 28)
+                total_weeks = dec28.isocalendar()[1]
+                data_output = [
+                    {"week": i, "total_energy": 0.0} for i in range(1, total_weeks + 1)
+                ]
 
-        start_ms = int(start_of_year_utc.timestamp() * 1000)
-        end_ms = int(end_of_year_utc.timestamp() * 1000)
+            else:
+                start_of_year_utc = datetime.datetime(year, 1, 1, tzinfo=timezone.utc)
+                end_of_year_utc = datetime.datetime(year + 1, 1, 1, tzinfo=timezone.utc)
 
-        all_flat_data = [
-            d for d in all_flat_data if start_ms <= d["timestamp"] < end_ms
-        ]
+                start_ms = int(start_of_year_utc.timestamp() * 1000)
+                end_ms = int(end_of_year_utc.timestamp() * 1000)
 
-        weekly_energy = defaultdict(float)
+                all_flat_data = [
+                    d for d in all_flat_data if start_ms <= d["timestamp"] < end_ms
+                ]
 
-        for row in all_flat_data:
-            dt = datetime.datetime.fromtimestamp(
-                row["timestamp"] / 1000, tz=timezone.utc
-            )
-            iso_year, iso_week, _ = dt.isocalendar()  # returns (year, week, weekday)
-            if iso_year == year:
-                weekly_energy[iso_week] += row["energy"]
+                weekly_energy = defaultdict(float)
 
-        # Determine total weeks in the year
-        dec28 = datetime.date(year, 12, 28)
-        total_weeks = dec28.isocalendar()[1]
+                for row in all_flat_data:
+                    dt = datetime.datetime.fromtimestamp(
+                        row["timestamp"] / 1000, tz=timezone.utc
+                    )
+                    iso_year, iso_week, _ = (
+                        dt.isocalendar()
+                    )  # returns (year, week, weekday)
+                    if iso_year == year:
+                        weekly_energy[iso_week] += row["energy"]
 
-        # Fill missing weeks with 0.0
-        data_output = [
-            {"week": w, "total_energy": round(float(weekly_energy.get(w, 0.0)), 6)}
-            for w in range(1, total_weeks + 1)
-        ]
+                # Determine total weeks in the year
+                dec28 = datetime.date(year, 12, 28)
+                total_weeks = dec28.isocalendar()[1]
 
-    return data_output
+                # Fill missing weeks with 0.0
+                data_output = [
+                    {
+                        "week": w,
+                        "total_energy": round(float(weekly_energy.get(w, 0.0)), 6),
+                        "year": year,
+                    }
+                    for w in range(1, total_weeks + 1)
+                ]
+
+                records = [WeeksEnergy(**item) for item in data_output]
+                session.add_all(records)
+                session.commit()
+
+            return data_output
+
+        return results
 
 
-@meter_router.get(
-    "/month/{year}/{month}", response_model=List[output.MonthOfYearResponse]
-)
+@meter_router.get("/month/{year}/{month}", response_model=List[MonthOfYearResponse])
 async def get_month_of_year(
     meter_id: int,
     year: int,
@@ -474,7 +497,7 @@ async def get_month_of_year(
     return output_array
 
 
-@meter_router.get("/activities", response_model=output.ActivitiesResponse)
+@meter_router.get("/activities", response_model=ActivitiesResponse)
 async def get_activities(meter_id: int, after: str | None = None, limit: int = 10):
     """
     Get activities of a m3ter
