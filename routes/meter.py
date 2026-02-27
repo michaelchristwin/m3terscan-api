@@ -189,152 +189,209 @@ async def get_weeks_of_year(meter_id: int, year: int):
         raise ValueError(f"No data exists before {genesis_year}")
 
     now = datetime.datetime.now(timezone.utc)
+    today = now.date()
     current_year = now.year
 
     if year > current_year:
         raise ValueError("Cannot calculate future year blocks")
+
+    async def fetch_page(min_block, max_block, cursor=None):
+        variables = {
+            "meterNumber": meter_id,
+            "block": {"min": min_block, "max": max_block},
+            "first": 3000,
+            "sortBy": "HEIGHT_ASC",
+            "after": cursor,
+        }
+
+        query = gql(
+            """
+            query WeeksQuery(
+              $meterNumber: Int!,
+              $block: BlockFilter,
+              $first: Int!,
+              $sortBy: MeterDataPointOrderBy,
+              $after: String
+            ) {
+              meterDataPoints(
+                meterNumber: $meterNumber,
+                block: $block,
+                first: $first,
+                sortBy: $sortBy,
+                after: $after
+              ) {
+                node {
+                  timestamp
+                  payload { energy }
+                }
+                cursor
+              }
+            }
+            """
+        )
+
+        query.variable_values = variables
+        result = await graphql.gql_query(query)
+
+        return [
+            {
+                "timestamp": i["node"]["timestamp"],
+                "energy": i["node"]["payload"]["energy"],
+                "cursor": i["cursor"],
+            }
+            for i in result.get("meterDataPoints", [])
+        ]
+
+    def total_weeks_in_year(y: int) -> int:
+        dec28 = datetime.date(y, 12, 28)
+        return dec28.isocalendar()[1]
+
+    def build_zero_output(y: int):
+        return [
+            {"week": w, "total_energy": 0.0, "year": y}
+            for w in range(1, total_weeks_in_year(y) + 1)
+        ]
+
+    def aggregate_weekly(data):
+        weekly = defaultdict(float)
+
+        for row in data:
+            dt = datetime.datetime.fromtimestamp(
+                row["timestamp"] / 1000, tz=timezone.utc
+            )
+            iso_year, iso_week, _ = dt.isocalendar()
+            if iso_year == year:
+                weekly[iso_week] += row["energy"]
+
+        return weekly
+
+    def to_output(weekly):
+        return [
+            {
+                "week": w,
+                "total_energy": round(float(weekly.get(w, 0.0)), 6),
+                "year": year,
+            }
+            for w in range(1, total_weeks_in_year(year) + 1)
+        ]
+
+    height, _ = latest_block.get_latest_block()
+
     with Session(engine) as session:
         statement = select(WeeksEnergy).where(WeeksEnergy.year == year)
-        results = session.exec(statement).all()
+        db_results = session.exec(statement).all()
 
-        if not results:
-            height, _ = latest_block.get_latest_block()
-
-            today = now.date()
-
-            # Start and end of requested year
+        # --------------------------------------------------
+        # INITIAL POPULATION (no DB records exist)
+        # --------------------------------------------------
+        if not db_results:
             start_of_year = datetime.date(year, 1, 1)
+            end_of_year = today if year == current_year else datetime.date(year, 12, 31)
 
-            if year == current_year:
-                end_of_year = today
-            else:
-                end_of_year = datetime.date(year, 12, 31)
-
-            # Days from start_of_requested_year to today
+            days_in_range = (end_of_year - start_of_year).days + 1
             days_since_start = (today - start_of_year).days
-
-            # Days in the requested year
-            days_in_year = (end_of_year - start_of_year).days + 1
 
             if year == current_year:
                 min_block = height - (days_since_start * blocks_per_day)
                 max_block = height
             else:
-                # Days between end of requested year and today
                 days_after_year = (today - end_of_year).days
-
                 max_block = height - (days_after_year * blocks_per_day)
-                min_block = max_block - (days_in_year * blocks_per_day)
-            print(f"Min Block: {min_block}")
-            print(f"Max Block: {max_block}")
+                min_block = max_block - (days_in_range * blocks_per_day)
 
-            async def fetch_page(cursor: str | None = None):
-                variables = {
-                    "meterNumber": meter_id,
-                    "block": {"min": min_block, "max": max_block},
-                    "first": 3000,
-                    "sortBy": "HEIGHT_ASC",
-                    "after": cursor,
-                }
-
-                query = gql(
-                    """
-                    query WeeksQuery(
-                      $meterNumber: Int!,
-                      $block: BlockFilter,
-                      $first: Int!,
-                      $sortBy: MeterDataPointOrderBy,
-                      $after: String
-                    ) {
-                      meterDataPoints(
-                        meterNumber: $meterNumber,
-                        block: $block,
-                        first: $first,
-                        sortBy: $sortBy,
-                        after: $after
-                      ) {
-                        node {
-                          timestamp
-                          payload { energy }
-                        }
-                        cursor
-                      }
-                    }
-                    """
-                )
-                query.variable_values = variables
-                result = await graphql.gql_query(query)
-
-                return [
-                    {
-                        "timestamp": i["node"]["timestamp"],
-                        "energy": i["node"]["payload"]["energy"],
-                        "cursor": i["cursor"],
-                    }
-                    for i in result.get("meterDataPoints", [])
-                ]
-
-            all_flat_data = []
+            all_data = []
             cursor = None
 
             while True:
-                page = await fetch_page(cursor)
+                page = await fetch_page(min_block, max_block, cursor)
                 if not page:
                     break
-                all_flat_data.extend(page)
+                all_data.extend(page)
                 cursor = page[-1]["cursor"]
 
-            if not all_flat_data:
-                dec28 = datetime.date(year, 12, 28)
-                total_weeks = dec28.isocalendar()[1]
-                data_output = [
-                    {"week": i, "total_energy": 0.0} for i in range(1, total_weeks + 1)
-                ]
-
+            if not all_data:
+                data_output = build_zero_output(year)
             else:
-                start_of_year_utc = datetime.datetime(year, 1, 1, tzinfo=timezone.utc)
-                end_of_year_utc = datetime.datetime(year + 1, 1, 1, tzinfo=timezone.utc)
+                start_ms = int(
+                    datetime.datetime(year, 1, 1, tzinfo=timezone.utc).timestamp()
+                    * 1000
+                )
+                end_ms = int(
+                    datetime.datetime(year + 1, 1, 1, tzinfo=timezone.utc).timestamp()
+                    * 1000
+                )
 
-                start_ms = int(start_of_year_utc.timestamp() * 1000)
-                end_ms = int(end_of_year_utc.timestamp() * 1000)
+                filtered = [d for d in all_data if start_ms <= d["timestamp"] < end_ms]
 
-                all_flat_data = [
-                    d for d in all_flat_data if start_ms <= d["timestamp"] < end_ms
-                ]
+                weekly = aggregate_weekly(filtered)
+                data_output = to_output(weekly)
 
-                weekly_energy = defaultdict(float)
-
-                for row in all_flat_data:
-                    dt = datetime.datetime.fromtimestamp(
-                        row["timestamp"] / 1000, tz=timezone.utc
-                    )
-                    iso_year, iso_week, _ = (
-                        dt.isocalendar()
-                    )  # returns (year, week, weekday)
-                    if iso_year == year:
-                        weekly_energy[iso_week] += row["energy"]
-
-                # Determine total weeks in the year
-                dec28 = datetime.date(year, 12, 28)
-                total_weeks = dec28.isocalendar()[1]
-
-                # Fill missing weeks with 0.0
-                data_output = [
-                    {
-                        "week": w,
-                        "total_energy": round(float(weekly_energy.get(w, 0.0)), 6),
-                        "year": year,
-                    }
-                    for w in range(1, total_weeks + 1)
-                ]
-
-                records = [WeeksEnergy(**item) for item in data_output]
-                session.add_all(records)
-                session.commit()
+            records = [WeeksEnergy(**item) for item in data_output]
+            session.add_all(records)
+            session.commit()
 
             return data_output
 
-        return results
+        # --------------------------------------------------
+        # CURRENT YEAR UPDATE (only update current week)
+        # --------------------------------------------------
+        if year == current_year:
+            week_number = today.isocalendar().week
+
+            week_start = today - datetime.timedelta(days=today.weekday())
+            week_start_dt = datetime.datetime.combine(
+                week_start, datetime.time.min, tzinfo=timezone.utc
+            )
+
+            seconds_since_week_start = (now - week_start_dt).total_seconds()
+            blocks_since_week_start = int(seconds_since_week_start / 120)
+
+            min_block = height - blocks_since_week_start
+
+            all_data = []
+            cursor = None
+
+            while True:
+                page = await fetch_page(min_block, height, cursor)
+                if not page:
+                    break
+                all_data.extend(page)
+                cursor = page[-1]["cursor"]
+
+            if all_data:
+                weekly = aggregate_weekly(all_data)
+                current_week_energy = round(float(weekly.get(week_number, 0.0)), 6)
+
+                stmt = select(WeeksEnergy).where(
+                    (WeeksEnergy.year == year) & (WeeksEnergy.week == week_number)
+                )
+
+                existing = session.exec(stmt).one_or_none()
+
+                if existing:
+                    existing.total_energy = current_week_energy
+                else:
+                    session.add(
+                        WeeksEnergy(
+                            year=year,
+                            week=week_number,
+                            total_energy=current_week_energy,
+                        )
+                    )
+
+                session.commit()
+
+            # always return fresh DB state
+            db_results = session.exec(statement).all()
+
+        return [
+            {
+                "week": r.week,
+                "total_energy": r.total_energy,
+                "year": r.year,
+            }
+            for r in db_results
+        ]
 
 
 @meter_router.get("/month/{year}/{month}", response_model=List[MonthOfYearResponse])
