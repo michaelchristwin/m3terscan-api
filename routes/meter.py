@@ -3,30 +3,28 @@ APIRouter module for meter endpoint.
 """
 
 import asyncio
-import calendar
 import datetime
-import json
 from collections import defaultdict
 from datetime import timezone
 from typing import Any, Dict, List
 
 from fastapi import APIRouter, Query
-from glide import ExpirySet, ExpiryType
 from gql import gql
 from sqlmodel import Session, select
 
-from config import graphql, valkey_client
+from config import graphql
 from database import engine
 from handlers import daily
+from models.monthly import MonthlyEnergy
 from models.output import (
     ActivitiesResponse,
     DailyResponse,
-    MonthOfYearResponse,
     WeeklyResponse,
 )
 from models.weeks_of_year import WeeksEnergy
+from schemas.monthly import MonthlyEnergyRead
 from schemas.weeks_of_year import WeeksEnergyRead
-from utils import latest_block
+from utils import latest_block, subgraph
 
 meter_router = APIRouter(prefix="/meter/{meter_id}")
 
@@ -195,53 +193,6 @@ async def get_weeks_of_year(meter_id: int, year: int):
     if year > current_year:
         raise ValueError("Cannot calculate future year blocks")
 
-    async def fetch_page(min_block, max_block, cursor=None):
-        variables = {
-            "meterNumber": meter_id,
-            "block": {"min": min_block, "max": max_block},
-            "first": 3000,
-            "sortBy": "HEIGHT_ASC",
-            "after": cursor,
-        }
-
-        query = gql(
-            """
-            query WeeksQuery(
-              $meterNumber: Int!,
-              $block: BlockFilter,
-              $first: Int!,
-              $sortBy: MeterDataPointOrderBy,
-              $after: String
-            ) {
-              meterDataPoints(
-                meterNumber: $meterNumber,
-                block: $block,
-                first: $first,
-                sortBy: $sortBy,
-                after: $after
-              ) {
-                node {
-                  timestamp
-                  payload { energy }
-                }
-                cursor
-              }
-            }
-            """
-        )
-
-        query.variable_values = variables
-        result = await graphql.gql_query(query)
-
-        return [
-            {
-                "timestamp": i["node"]["timestamp"],
-                "energy": i["node"]["payload"]["energy"],
-                "cursor": i["cursor"],
-            }
-            for i in result.get("meterDataPoints", [])
-        ]
-
     def total_weeks_in_year(y: int) -> int:
         dec28 = datetime.date(y, 12, 28)
         return dec28.isocalendar()[1]
@@ -303,7 +254,7 @@ async def get_weeks_of_year(meter_id: int, year: int):
             cursor = None
 
             while True:
-                page = await fetch_page(min_block, max_block, cursor)
+                page = await subgraph.fetch_page(meter_id, min_block, max_block, cursor)
                 if not page:
                     break
                 all_data.extend(page)
@@ -352,7 +303,7 @@ async def get_weeks_of_year(meter_id: int, year: int):
             cursor = None
 
             while True:
-                page = await fetch_page(min_block, height, cursor)
+                page = await subgraph.fetch_page(min_block, height, height, cursor)
                 if not page:
                     break
                 all_data.extend(page)
@@ -394,164 +345,199 @@ async def get_weeks_of_year(meter_id: int, year: int):
         ]
 
 
-@meter_router.get("/month/{year}/{month}", response_model=List[MonthOfYearResponse])
+@meter_router.get("/month/{month}/{year}", response_model=List[MonthlyEnergyRead])
 async def get_month_of_year(
     meter_id: int,
     year: int,
     month: int,
 ):
     """
-    Get energy usage of a month in a specified year using pagination and timestamp filtering.
+    Get daily energy usage for a given month in a specified year.
     """
     genesis_year = 2025
+    blocks_per_day = 720  # 1 block every 2 minutes
+
     if year < genesis_year:
         raise ValueError(f"No data exists before {genesis_year}")
 
-    vc = valkey_client.ValkeyManager.get_client()
-    cache_key = f"energy:{meter_id}:month:{year}:{month}"
-    cached = await vc.get(cache_key)
-    if cached:
-        return json.loads(cached)
-    height, _ = latest_block.get_latest_block()
-    today = datetime.date.today()
+    now = datetime.datetime.now(timezone.utc)
+    today = now.date()
+    current_year = now.year
+
     target = datetime.date(year, month, 1)
+
     if target > today.replace(day=1):
         raise ValueError("Future month not allowed")
-    current_year = datetime.datetime.now(timezone.utc).year
 
-    # --- BLOCK RANGE ESTIMATION (For initial GraphQL fetch) ---
-    # This range is just a safeguard; the timestamp filter is the precise boundary.
-    blocks_per_day = 720
-    last_day = calendar.monthrange(year, month)[1]
+    if year > current_year:
+        raise ValueError("Cannot calculate future year blocks")
 
-    # Estimate the difference in days from today to the start of the target month
-    days_diff_to_start = (today - target).days
-    min_block = height - (days_diff_to_start * blocks_per_day)
-    min_block = max(1, min_block)
+    def month_range(y, m):
+        start = datetime.date(y, m, 1)
+        if m == 12:
+            end = datetime.date(y + 1, 1, 1)
+        else:
+            end = datetime.date(y, m + 1, 1)
+        return start, end
 
-    # Estimate the difference in blocks for the duration of the month
-    blocks_in_month = last_day * blocks_per_day
+    def days_in_month(y, m):
+        start, end = month_range(y, m)
+        return (end - start).days
 
-    # Max block is the minimum of the estimated end block or the current chain height
-    max_block = min(min_block + blocks_in_month, height)
+    height, _ = latest_block.get_latest_block()
 
-    # --- PAGINATION LOGIC ---
-
-    async def fetch_page(cursor: str | None = None):
-        """Fetches a page of data from the GraphQL endpoint."""
-        variables = {
-            "meterNumber": meter_id,
-            "block": {"min": min_block, "max": max_block},
-            "first": 2000,  # Set as requested
-            "sortBy": "HEIGHT_ASC",
-            "after": cursor,
-        }
-
-        # Note: Added $first, $sortBy, and $after variables to the query definition
-        query = gql(
-            """
-        query MonthQuery($meterNumber: Int!,
-                         $block: BlockFilter,
-                         $first: Int!,
-                         $sortBy: MeterDataPointOrderBy,
-                         $after: String) {
-        meterDataPoints(meterNumber: $meterNumber,
-                         block: $block,
-                         first: $first,
-                         sortBy: $sortBy,
-                         after: $after) {
-                node {
-                    timestamp
-                    payload {
-                        energy
-                    }
-                }
-                cursor
-            }
-        }
-        """
+    with Session(engine) as session:
+        stmt = select(MonthlyEnergy).where(
+            (MonthlyEnergy.year == year) & (MonthlyEnergy.month == month)
         )
-        query.variable_values = variables
-        result = await graphql.gql_query(query)
-        items = result.get("meterDataPoints", [])
 
-        # Flatten data and include the cursor for the next iteration
+        db_results = session.exec(stmt).all()
+
+        # --------------------------------------------------
+        # INITIAL POPULATION
+        # --------------------------------------------------
+        if not db_results:
+            month_start, month_end = month_range(year, month)
+
+            if year == current_year and month == today.month:
+                end_date = today
+            else:
+                end_date = month_end - datetime.timedelta(days=1)
+
+            days_total = (end_date - month_start).days + 1
+            days_after = (today - end_date).days
+
+            if year == current_year and month == today.month:
+                min_block = height - ((today - month_start).days * blocks_per_day)
+                max_block = height
+            else:
+                max_block = height - (days_after * blocks_per_day)
+                min_block = max_block - (days_total * blocks_per_day)
+
+            all_data = []
+            cursor = None
+
+            while True:
+                page = await subgraph.fetch_page(meter_id, min_block, max_block, cursor)
+                if not page:
+                    break
+                all_data.extend(page)
+                cursor = page[-1]["cursor"]
+
+            daily_energy = defaultdict(float)
+
+            if all_data:
+                start_ms = int(
+                    datetime.datetime(year, month, 1, tzinfo=timezone.utc).timestamp()
+                    * 1000
+                )
+                end_ms = int(
+                    datetime.datetime(
+                        month_end.year,
+                        month_end.month,
+                        month_end.day,
+                        tzinfo=timezone.utc,
+                    ).timestamp()
+                    * 1000
+                )
+
+                filtered = [d for d in all_data if start_ms <= d["timestamp"] < end_ms]
+
+                for row in filtered:
+                    dt = datetime.datetime.fromtimestamp(
+                        row["timestamp"] / 1000, tz=timezone.utc
+                    )
+                    if dt.year == year and dt.month == month:
+                        daily_energy[dt.day] += row["energy"]
+
+            output = []
+            total_days = days_in_month(year, month)
+
+            for day in range(1, total_days + 1):
+                energy = round(float(daily_energy.get(day, 0.0)), 6)
+                output.append(
+                    MonthlyEnergy(
+                        year=year,
+                        month=month,
+                        day=day,
+                        total_energy=energy,
+                    )
+                )
+
+            session.add_all(output)
+            session.commit()
+
+            return [
+                {
+                    "year": r.year,
+                    "month": r.month,
+                    "day": r.day,
+                    "total_energy": r.total_energy,
+                }
+                for r in output
+            ]
+
+        # --------------------------------------------------
+        # CURRENT MONTH UPDATE (update only today)
+        # --------------------------------------------------
+        if year == current_year and month == today.month:
+            month_start, _ = month_range(year, month)
+
+            seconds_since_start = (
+                now
+                - datetime.datetime.combine(
+                    month_start, datetime.time.min, tzinfo=timezone.utc
+                )
+            ).total_seconds()
+
+            blocks_since_start = int(seconds_since_start / 120)
+            min_block = height - blocks_since_start
+
+            all_data = []
+            cursor = None
+
+            while True:
+                page = await subgraph.fetch_page(meter_id, min_block, height, cursor)
+                if not page:
+                    break
+                all_data.extend(page)
+                cursor = page[-1]["cursor"]
+
+            if all_data:
+                today_energy = 0.0
+
+                for row in all_data:
+                    dt = datetime.datetime.fromtimestamp(
+                        row["timestamp"] / 1000, tz=timezone.utc
+                    )
+                    if dt.year == year and dt.month == month and dt.day == today.day:
+                        today_energy += row["energy"]
+
+                today_energy = round(float(today_energy), 6)
+
+                stmt = select(MonthlyEnergy).where(
+                    (MonthlyEnergy.year == year)
+                    & (MonthlyEnergy.month == month)
+                    & (MonthlyEnergy.day == today.day)
+                )
+
+                existing = session.exec(stmt).one_or_none()
+
+                if existing:
+                    existing.total_energy = today_energy
+                    session.commit()
+
+            db_results = session.exec(stmt).all()
+
         return [
             {
-                "timestamp": i["node"]["timestamp"],
-                "energy": i["node"]["payload"]["energy"],
-                "cursor": i["cursor"],
+                "year": r.year,
+                "month": r.month,
+                "day": r.day,
+                "total_energy": r.total_energy,
             }
-            for i in items
+            for r in db_results
         ]
-
-    all_flat_data = []
-    cursor = None
-
-    while True:
-        page = await fetch_page(cursor)
-
-        if not page:
-            break
-        all_flat_data.extend(page)
-        cursor = page[-1][
-            "cursor"
-        ]  # Use the cursor of the last item for the next fetch
-
-    # --- FILTERING BY CALENDAR MONTH (UTC) ---
-
-    # 1. Define the start of the target month (1st of month, 00:00:00.000 UTC)
-    start_of_month_utc = datetime.datetime(year, month, 1, tzinfo=timezone.utc)
-
-    # 2. Define the start of the next month (1st of next month, 00:00:00.000 UTC)
-    if month == 12:
-        end_of_month_utc = datetime.datetime(year + 1, 1, 1, tzinfo=timezone.utc)
-    else:
-        end_of_month_utc = datetime.datetime(year, month + 1, 1, tzinfo=timezone.utc)
-
-    # 3. Convert boundary times to milliseconds for comparison
-    start_ms = int(start_of_month_utc.timestamp() * 1000)
-    end_ms = int(end_of_month_utc.timestamp() * 1000)
-
-    # 4. Sanitize: keep only data within the target calendar month [start_ms, end_ms)
-    all_flat_data = [
-        item for item in all_flat_data if start_ms <= item["timestamp"] < end_ms
-    ]
-
-    # ------------------------------------------------------------------
-    # 3. AGGREGATION AND ZERO-FILLING
-    # ------------------------------------------------------------------
-
-    # Re-check for empty data after filtering:
-    if not all_flat_data:
-        # If empty, return an array of 0 energy for every day in the month
-        output_array = [{"day": i, "total_energy": 0.0} for i in range(1, last_day + 1)]
-        return output_array
-
-    daily_energy = defaultdict(float)
-
-    for row in all_flat_data:
-        dt = datetime.datetime.fromtimestamp(row["timestamp"] / 1000, tz=timezone.utc)
-        day = dt.day  # 1 to 31
-        daily_energy[day] += row["energy"]
-
-    # Fill all days of the month
-    output_array = [
-        {"day": day, "total_energy": round(float(daily_energy.get(day, 0.0)), 6)}
-        for day in range(1, last_day + 1)
-    ]
-
-    # Create DataFrame and convert ms timestamp to UTC datetime
-    if year < current_year:
-        await vc.set(cache_key, json.dumps(output_array))
-    else:
-        # Current year → still useful, but allow expiry
-        await vc.set(
-            cache_key,
-            json.dumps(output_array),
-            expiry=ExpirySet(value=(6 * 3600), expiry_type=ExpiryType.SEC),
-        )
-    return output_array
 
 
 @meter_router.get("/activities", response_model=ActivitiesResponse)

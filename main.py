@@ -6,14 +6,13 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from sqlmodel import SQLModel
 
 from config import valkey_client
-from routes import meter, proposal
-from sqlmodel import SQLModel
 from database import engine
-
-
+from models.monthly import MonthlyEnergy
 from models.weeks_of_year import WeeksEnergy
+from routes import meter, proposal
 
 
 @asynccontextmanager
