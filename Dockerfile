@@ -12,8 +12,9 @@ COPY pyproject.toml uv.lock ./
 
 RUN uv sync --frozen && uv cache prune --ci
 
-# Then copy rest of code
 COPY . .
+
+ENV PATH="/app/.venv/bin:$PATH"
 
 EXPOSE 3000
 
