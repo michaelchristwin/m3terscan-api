@@ -4,16 +4,14 @@ FROM python:3.14.3-bookworm
 COPY --from=docker.io/astral/uv:latest /uv /uvx /bin/
 
 WORKDIR /app
-# Prevent uv from creating virtualenv (recommended in containers)
-ENV UV_SYSTEM_PYTHON=1
 
+ENV UV_COMPILE_BYTECODE=1
 
 # Copy only dependency files first (better caching)
 COPY pyproject.toml uv.lock ./
 
-RUN uv sync --frozen --no-dev && rm -rf ~/.cache/uv
+RUN uv sync --frozen && uv cache prune --ci
 
-RUN python --version && which gunicorn
 # Then copy rest of code
 COPY . .
 
