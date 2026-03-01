@@ -4,8 +4,10 @@ Valkey client.
 
 import os
 from typing import Optional
+from urllib.parse import urlparse
+
 from dotenv import load_dotenv
-from glide import GlideClientConfiguration, NodeAddress, GlideClient
+from glide import GlideClient, GlideClientConfiguration, NodeAddress
 
 load_dotenv(dotenv_path=".env.local")
 
@@ -14,18 +16,22 @@ class ValkeyManager:
     """Manages the lifecycle of the GlideClient connection."""
 
     _client: Optional[GlideClient] = None
-    _host: str = os.getenv("VALKEY_HOST", "")
+    _url = os.getenv("VALKEY_URL")
 
     @classmethod
-    async def init(cls) -> None:
-        """Initializes the client if it doesn't already exist."""
-        if not cls._host:
-            raise KeyError("VALKEY_HOST is not set.")
+    async def init(cls):
+        if not cls._url:
+            raise KeyError("VALKEY_URL not set")
 
-        if cls._client is None:
-            addresses = [NodeAddress(cls._host, 6379)]
-            config = GlideClientConfiguration(addresses, request_timeout=500)
-            cls._client = await GlideClient.create(config)
+        parsed = urlparse(cls._url)
+
+        host = parsed.hostname or ""
+        port = parsed.port or 6379
+
+        addresses = [NodeAddress(host, port)]
+        config = GlideClientConfiguration(addresses, request_timeout=500)
+
+        cls._client = await GlideClient.create(config)
 
     @classmethod
     async def close(cls) -> None:
