@@ -7,7 +7,7 @@ from typing import Optional
 from urllib.parse import urlparse
 
 from dotenv import load_dotenv
-from glide import GlideClient, GlideClientConfiguration, NodeAddress
+from glide import GlideClient, GlideClientConfiguration, NodeAddress, ServerCredentials
 
 load_dotenv(dotenv_path=".env.local")
 
@@ -24,12 +24,22 @@ class ValkeyManager:
             raise KeyError("VALKEY_URL not set")
 
         parsed = urlparse(cls._url)
+        # Extract authentication (if present)
+        username = parsed.username
+        password = parsed.password
 
         host = parsed.hostname or ""
         port = parsed.port or 6379
 
         addresses = [NodeAddress(host, port)]
-        config = GlideClientConfiguration(addresses, request_timeout=500)
+        if username or password:
+            config = GlideClientConfiguration(
+                addresses,
+                request_timeout=500,
+                credentials=ServerCredentials(password=password, username=username),
+            )
+        else:
+            config = GlideClientConfiguration(addresses, request_timeout=500)
 
         cls._client = await GlideClient.create(config)
 
