@@ -1,4 +1,4 @@
-FROM python:3.13-slim-bookworm
+FROM python:3.14.3-bookworm
 
 # Copy uv binary from official image
 COPY --from=docker.io/astral/uv:latest /uv /uvx /bin/
@@ -13,6 +13,7 @@ COPY pyproject.toml uv.lock ./
 
 RUN uv sync --frozen --no-dev && rm -rf ~/.cache/uv
 
+RUN python --version && which gunicorn
 # Then copy rest of code
 COPY . .
 
