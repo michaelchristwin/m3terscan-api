@@ -6,6 +6,8 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse
+from fastapi.staticfiles import StaticFiles
 from sqlmodel import SQLModel
 
 from config import valkey_client
@@ -47,14 +49,20 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon():
+    return RedirectResponse(url="/static/favicon.ico")
 
 
 @app.get("/")
 def read_root():
     """
-    Welcome message to our beloved users.
+    Welcome message to our users.
     """
-    return {"message": "Hello from the m3terscan API"}
+    return {"message": "Hello M3terheads 😎"}
 
 
 app.include_router(meter.meter_router)

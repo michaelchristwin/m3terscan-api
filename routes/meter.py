@@ -26,7 +26,7 @@ from schemas.monthly import MonthlyEnergyRead
 from schemas.weeks_of_year import WeeksEnergyRead
 from utils import latest_block, subgraph
 
-meter_router = APIRouter(prefix="/meter/{meter_id}")
+meter_router = APIRouter(prefix="/meter/{meter_id}", tags=["meter"])
 
 
 @meter_router.get("/daily", response_model=List[DailyResponse])
