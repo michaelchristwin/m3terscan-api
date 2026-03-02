@@ -2,13 +2,13 @@
 APIRouter module for meter endpoint.
 """
 
-import asyncio
+
 import datetime
 from collections import defaultdict
 from datetime import timezone
-from typing import Any, Dict, List
+from typing import List
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter
 from gql import gql
 from sqlmodel import Session, select
 
@@ -39,25 +39,6 @@ async def get_daily(meter_id: int):
     except RuntimeError as e:
         print(f"Cache error: {e}. Falling back to non-cached version.")
         return await daily.get_daily_without_cache(meter_id)
-
-
-@meter_router.get("/daily-batch")
-async def get_daily_batch(
-    meter_ids: List[int] = Query(
-        ..., description="Repeat param: ?meter_ids=1&meter_ids=2"
-    ),
-) -> Dict[str, Any]:
-    """
-    Get daily Batch
-    """
-
-    async def run_one(meter_id: int):
-        data = await daily.get_daily_with_cache(meter_id)
-        return meter_id, data
-
-    results = await asyncio.gather(*(run_one(mid) for mid in meter_ids))
-
-    return {str(meter_id): data for meter_id, data in results}
 
 
 @meter_router.get("/weekly", response_model=List[WeeklyResponse])

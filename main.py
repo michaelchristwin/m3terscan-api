@@ -2,9 +2,11 @@
 Project entry point for m3terscan API.
 """
 
+import asyncio
 from contextlib import asynccontextmanager
+from typing import Any, Dict, List
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
@@ -12,6 +14,7 @@ from sqlmodel import SQLModel
 
 from config import valkey_client
 from database import engine
+from handlers.daily import get_daily_with_cache
 from models.monthly import MonthlyEnergy
 from models.weeks_of_year import WeeksEnergy
 from routes import meter, proposal
@@ -63,6 +66,25 @@ def read_root():
     Welcome message to our users.
     """
     return {"message": "Hello M3terheads 😎"}
+
+
+@app.get("/daily-batch")
+async def get_daily_batch(
+    meter_ids: List[int] = Query(
+        ..., description="Repeat param: ?meter_ids=1&meter_ids=2"
+    ),
+) -> Dict[str, Any]:
+    """
+    Get daily Batch
+    """
+
+    async def run_one(meter_id: int):
+        data = await get_daily_with_cache(meter_id)
+        return meter_id, data
+
+    results = await asyncio.gather(*(run_one(mid) for mid in meter_ids))
+
+    return {str(meter_id): data for meter_id, data in results}
 
 
 app.include_router(meter.meter_router)
