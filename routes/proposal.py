@@ -4,19 +4,20 @@ APIRouter for the proposal endpoint.
 
 import sqlite3
 from typing import List
-from fastapi import APIRouter
-from fastapi import HTTPException
+
 from eth_typing import HexStr
+from fastapi import APIRouter, HTTPException
 from web3 import Web3
-from orm import load_db
+
 from config import eth_rpc
-from models import output
 from contracts import loader
+from models import output
+from orm import load_db
 from utils import helpers
 
 rollup_abi = loader.load_abi("Rollup")
 
-proposal_router = APIRouter(prefix="/proposal")
+proposal_router = APIRouter(prefix="/proposal", tags=["proposal"])
 
 
 @proposal_router.get("/{tx_hash}", response_model=List[output.ProposalsResponse])
