@@ -2,7 +2,6 @@
 APIRouter module for meter endpoint.
 """
 
-
 import datetime
 from collections import defaultdict
 from datetime import timezone
@@ -203,6 +202,7 @@ async def get_weeks_of_year(meter_id: int, year: int):
                 "week": w,
                 "total_energy": round(float(weekly.get(w, 0.0)), 6),
                 "year": year,
+                "meter_id": meter_id,
             }
             for w in range(1, total_weeks_in_year(year) + 1)
         ]
@@ -210,7 +210,9 @@ async def get_weeks_of_year(meter_id: int, year: int):
     height, _ = latest_block.get_latest_block()
 
     with Session(engine) as session:
-        statement = select(WeeksEnergy).where(WeeksEnergy.year == year)
+        statement = select(WeeksEnergy).where(
+            (WeeksEnergy.year == year) & (WeeksEnergy.meter_id == meter_id)
+        )
         db_results = session.exec(statement).all()
 
         # --------------------------------------------------
@@ -258,7 +260,7 @@ async def get_weeks_of_year(meter_id: int, year: int):
                 weekly = aggregate_weekly(filtered)
                 data_output = to_output(weekly)
 
-            records = [WeeksEnergy(**item) for item in data_output]
+            records = [WeeksEnergy(meter_id=meter_id, **item) for item in data_output]
             session.add_all(records)
             session.commit()
 
@@ -295,7 +297,9 @@ async def get_weeks_of_year(meter_id: int, year: int):
                 current_week_energy = round(float(weekly.get(week_number, 0.0)), 6)
 
                 stmt = select(WeeksEnergy).where(
-                    (WeeksEnergy.year == year) & (WeeksEnergy.week == week_number)
+                    WeeksEnergy.year == year,
+                    WeeksEnergy.week == week_number,
+                    WeeksEnergy.meter_id == meter_id,
                 )
 
                 existing = session.exec(stmt).one_or_none()
@@ -305,6 +309,7 @@ async def get_weeks_of_year(meter_id: int, year: int):
                 else:
                     session.add(
                         WeeksEnergy(
+                            meter_id=meter_id,
                             year=year,
                             week=week_number,
                             total_energy=current_week_energy,
@@ -321,6 +326,7 @@ async def get_weeks_of_year(meter_id: int, year: int):
                 "week": r.week,
                 "total_energy": r.total_energy,
                 "year": r.year,
+                "meter_id": r.meter_id,
             }
             for r in db_results
         ]
@@ -369,7 +375,9 @@ async def get_month_of_year(
 
     with Session(engine) as session:
         stmt = select(MonthlyEnergy).where(
-            (MonthlyEnergy.year == year) & (MonthlyEnergy.month == month)
+            (MonthlyEnergy.year == year)
+            & (MonthlyEnergy.month == month)
+            & (MonthlyEnergy.metadata == meter_id)
         )
 
         db_results = session.exec(stmt).all()
@@ -431,13 +439,14 @@ async def get_month_of_year(
                     if dt.year == year and dt.month == month:
                         daily_energy[dt.day] += row["energy"]
 
-            output = []
+            output: List[MonthlyEnergy] = []
             total_days = days_in_month(year, month)
 
             for day in range(1, total_days + 1):
                 energy = round(float(daily_energy.get(day, 0.0)), 6)
                 output.append(
                     MonthlyEnergy(
+                        meter_id=meter_id,
                         year=year,
                         month=month,
                         day=day,
@@ -453,6 +462,7 @@ async def get_month_of_year(
                     "year": r.year,
                     "month": r.month,
                     "day": r.day,
+                    "meter_id": r.meter_id,
                     "total_energy": r.total_energy,
                 }
                 for r in output
@@ -497,9 +507,10 @@ async def get_month_of_year(
                 today_energy = round(float(today_energy), 6)
 
                 stmt = select(MonthlyEnergy).where(
-                    (MonthlyEnergy.year == year)
-                    & (MonthlyEnergy.month == month)
-                    & (MonthlyEnergy.day == today.day)
+                    MonthlyEnergy.year == year,
+                    MonthlyEnergy.month == month,
+                    MonthlyEnergy.day == today.day,
+                    WeeksEnergy.meter_id == meter_id,
                 )
 
                 existing = session.exec(stmt).one_or_none()
@@ -516,6 +527,7 @@ async def get_month_of_year(
                 "month": r.month,
                 "day": r.day,
                 "total_energy": r.total_energy,
+                "meter_id": r.meter_id,
             }
             for r in db_results
         ]
