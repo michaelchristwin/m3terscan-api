@@ -260,7 +260,7 @@ async def get_weeks_of_year(meter_id: int, year: int):
                 weekly = aggregate_weekly(filtered)
                 data_output = to_output(weekly)
 
-            records = [WeeksEnergy(meter_id=meter_id, **item) for item in data_output]
+            records = [WeeksEnergy(**item) for item in data_output]
             session.add_all(records)
             session.commit()
 
