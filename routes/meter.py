@@ -211,17 +211,17 @@ async def get_weeks_of_year(meter_id: int, year: int):
 
     with Session(engine) as session:
         statement = select(WeeksEnergy).where(
-            (WeeksEnergy.year == year) & (WeeksEnergy.meter_id == meter_id)
+            WeeksEnergy.year == year, WeeksEnergy.meter_id == meter_id
         )
         db_results = session.exec(statement).all()
 
         # --------------------------------------------------
-        # INITIAL POPULATION (no DB records exist)
+        # INITIAL POPULATION (no DB records exist or partially populated)
         # --------------------------------------------------
-        if not db_results:
+        if not db_results or len(db_results) < total_weeks_in_year(year):
+            # Generate the week output as before
             start_of_year = datetime.date(year, 1, 1)
             end_of_year = today if year == current_year else datetime.date(year, 12, 31)
-
             days_in_range = (end_of_year - start_of_year).days + 1
             days_since_start = (today - start_of_year).days
 
@@ -254,18 +254,28 @@ async def get_weeks_of_year(meter_id: int, year: int):
                     datetime.datetime(year + 1, 1, 1, tzinfo=timezone.utc).timestamp()
                     * 1000
                 )
-
                 filtered = [d for d in all_data if start_ms <= d["timestamp"] < end_ms]
-
                 weekly = aggregate_weekly(filtered)
                 data_output = to_output(weekly)
 
-            records = [WeeksEnergy(**item) for item in data_output]
-            session.add_all(records)
+            # ----------- Safe DB insertion/update -----------
+            for item in data_output:
+                stmt = select(WeeksEnergy).where(
+                    WeeksEnergy.year == year,
+                    WeeksEnergy.week == item["week"],
+                    WeeksEnergy.meter_id == meter_id,
+                )
+                existing = session.exec(stmt).one_or_none()
+                if existing:
+                    # Update total_energy if already exists
+                    existing.total_energy = item["total_energy"]
+                else:
+                    # Insert new record
+                    session.add(WeeksEnergy(**item))
+
             session.commit()
-
-            return data_output
-
+            # refresh db_results
+            db_results = session.exec(statement).all()
         # --------------------------------------------------
         # CURRENT YEAR UPDATE (only update current week)
         # --------------------------------------------------
