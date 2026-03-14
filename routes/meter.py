@@ -179,7 +179,7 @@ async def get_weeks_of_year(meter_id: int, year: int):
 
     def build_zero_output(y: int):
         return [
-            {"week": w, "total_energy": 0.0, "year": y}
+            WeeksEnergy(week=w, total_energy=0.0, year=y, meter_id=meter_id)
             for w in range(1, total_weeks_in_year(y) + 1)
         ]
 
@@ -198,12 +198,12 @@ async def get_weeks_of_year(meter_id: int, year: int):
 
     def to_output(weekly):
         return [
-            {
-                "week": w,
-                "total_energy": round(float(weekly.get(w, 0.0)), 6),
-                "year": year,
-                "meter_id": meter_id,
-            }
+            WeeksEnergy(
+                week=w,
+                total_energy=round(float(weekly.get(w, 0.0)), 6),
+                year=year,
+                meter_id=meter_id,
+            )
             for w in range(1, total_weeks_in_year(year) + 1)
         ]
 
@@ -262,16 +262,16 @@ async def get_weeks_of_year(meter_id: int, year: int):
             for item in data_output:
                 stmt = select(WeeksEnergy).where(
                     WeeksEnergy.year == year,
-                    WeeksEnergy.week == item["week"],
+                    WeeksEnergy.week == item.week,
                     WeeksEnergy.meter_id == meter_id,
                 )
                 existing = session.exec(stmt).one_or_none()
                 if existing:
                     # Update total_energy if already exists
-                    existing.total_energy = item["total_energy"]
+                    existing.total_energy = item.total_energy
                 else:
                     # Insert new record
-                    session.add(WeeksEnergy(**item))
+                    session.add(item)
 
             session.commit()
             # refresh db_results
