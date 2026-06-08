@@ -16,8 +16,7 @@ async def fetch_page(
     }
 
     # Note: Added $first, $sortBy, and $after variables to the query definition
-    query = gql(
-        """
+    query = gql("""
     query BaseQuery($meterNumber: Int!,
                      $block: BlockFilter,
                      $first: Int!,
@@ -37,8 +36,7 @@ async def fetch_page(
             cursor
         }
     }
-    """
-    )
+    """)
     query.variable_values = variables
     result = await graphql.gql_query(query)
     items = result.get("meterDataPoints", [])
