@@ -71,3 +71,24 @@ class ProposalsResponse(BaseModel):
     m3ter_no: int
     account: str
     nonce: int
+
+
+class BlockData(BaseModel):
+    """
+    lorem ipsum
+    """
+
+    block_time: str
+    from_add: str
+    hash: str
+    tx_status: bool
+
+
+class WorldStateData(BaseModel):
+    """
+    Lorem ipsum
+    """
+
+    account: str
+    id: int
+    nonce: int
