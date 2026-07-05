@@ -9,6 +9,7 @@ wheels/
 # Virtual environments
 .venv
 .env.local
+.env
 *.db
 m3ters.db-shm
 m3ters.db-wal

@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "alembic>=1.18.4",
+    "dune-client>=1.11.3",
     "fastapi[standard]>=0.123.2",
     "gql[all]>=4.0.0",
     "gunicorn>=23.0.0",

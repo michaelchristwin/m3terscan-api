@@ -9,7 +9,7 @@ from urllib.parse import urlparse
 from dotenv import load_dotenv
 from glide import GlideClient, GlideClientConfiguration, NodeAddress, ServerCredentials
 
-load_dotenv(dotenv_path=".env.local")
+load_dotenv(dotenv_path=".env")
 
 
 class ValkeyManager:
