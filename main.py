@@ -3,14 +3,18 @@ Project entry point for m3terscan API.
 """
 
 import asyncio
+import os
 from contextlib import asynccontextmanager
 from typing import Any, Dict, List
+from dotenv import load_dotenv
 
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from sqlmodel import SQLModel
+from dune_client.client import DuneClient
+from dune_client.query import QueryBase
 
 from config import valkey_client
 from database import engine
@@ -18,6 +22,8 @@ from handlers.daily import get_daily_with_cache
 from models.monthly import MonthlyEnergy
 from models.weeks_of_year import WeeksEnergy
 from routes import meter, proposal
+
+load_dotenv(dotenv_path=".env")
 
 
 @asynccontextmanager
@@ -69,6 +75,26 @@ def read_root():
     Welcome message to our users.
     """
     return {"message": "Hello M3terheads 😎"}
+
+
+@app.get("/recent-blocks")
+async def get_recent_blocks():
+    """
+    Get latest blocks
+    """
+    dune_api_key = os.getenv("DUNE_API_KEY")
+    dune = DuneClient(dune_api_key)
+    return dune.get_latest_result(query=5911866)
+
+
+@app.post("/recent-blocks")
+async def execute_recent_blocks():
+    """
+    Execute query for recent blocks on dune
+    """
+    dune_api_key = os.getenv("DUNE_API_KEY")
+    dune = DuneClient(dune_api_key)
+    return dune.execute_query(performance="medium", query=QueryBase(query_id=5911866))
 
 
 @app.get("/daily-batch")
