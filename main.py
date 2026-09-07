@@ -48,6 +48,7 @@ origins = [
     "https://m3terscan.m3ter.ing",
     "https://explore.m3ter.ing",
     "https://m3terscan-rr.vercel.app",
+    "https://m3terstate-diff.pages.dev"
 ]
 
 app = FastAPI(lifespan=lifespan)
