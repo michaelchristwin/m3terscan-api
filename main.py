@@ -5,12 +5,12 @@ Project entry point for m3terscan API.
 import asyncio
 import os
 from contextlib import asynccontextmanager
-from typing import Any, Dict, List
-from dotenv import load_dotenv
+from typing import Any
 
-from dune_client.types import DuneRecord
+from dotenv import load_dotenv
 from dune_client.client import DuneClient
 from dune_client.query import QueryBase
+from dune_client.types import DuneRecord
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
@@ -48,7 +48,7 @@ origins = [
     "https://m3terscan.m3ter.ing",
     "https://explore.m3ter.ing",
     "https://m3terscan-rr.vercel.app",
-    "https://m3terstate-diff.pages.dev"
+    "https://m3terstate-diff.pages.dev",
 ]
 
 app = FastAPI(lifespan=lifespan)
@@ -97,7 +97,8 @@ async def execute_recent_blocks():
     """
     dune_api_key = os.getenv("DUNE_API_KEY")
     dune = DuneClient(dune_api_key)
-    return dune.execute_query(performance="medium", query=QueryBase(query_id=5911866))
+    query = QueryBase(query_id=5911866)
+    return dune.run_query(performance="small", query=query)
 
 
 @app.get("/world-state")
@@ -113,10 +114,10 @@ async def get_world_state() -> list[DuneRecord]:
 
 @app.get("/daily-batch")
 async def get_daily_batch(
-    meter_ids: List[int] = Query(
+    meter_ids: list[int] = Query(
         ..., description="Repeat param: ?meter_ids=1&meter_ids=2"
     ),
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """
     Get daily Batch
     """
