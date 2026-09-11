@@ -112,7 +112,7 @@ async def execute_recent_blocks(request: Request):
     """
     dune_http = request.app.state.dune_http
     return await run_dune_query(
-        dune_http=dune_http, query_id=5911866, performance="small"
+        dune_http=dune_http, query_id=5911866, performance="medium"
     )
 
 
