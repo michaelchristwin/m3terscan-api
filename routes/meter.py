@@ -7,7 +7,7 @@ from collections import defaultdict
 from datetime import timezone
 from typing import List
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 from gql import gql
 from sqlmodel import Session, select
 
@@ -29,23 +29,23 @@ meter_router = APIRouter(prefix="/meter/{meter_id}", tags=["meter"])
 
 
 @meter_router.get("/daily", response_model=List[DailyResponse])
-async def get_daily(meter_id: int):
+async def get_daily(meter_id: int, request: Request):
     """
     Get daily energy usage aggregate.
     """
     try:
-        return await daily.get_daily_with_cache(meter_id)
+        return await daily.get_daily_with_cache(meter_id, request=request)
     except RuntimeError as e:
         print(f"Cache error: {e}. Falling back to non-cached version.")
-        return await daily.get_daily_without_cache(meter_id)
+        return await daily.get_daily_without_cache(meter_id, request=request)
 
 
 @meter_router.get("/weekly", response_model=List[WeeklyResponse])
-async def get_weekly(meter_id: int):
+async def get_weekly(meter_id: int, request: Request):
     """
     Get weekly energy usage aggregate.
     """
-    height, _ = latest_block.get_latest_block()
+    height, _ = await latest_block.get_latest_block(request=request)
     interval = datetime.datetime.now().weekday() * 720
     min_block = height - interval
 
@@ -59,8 +59,7 @@ async def get_weekly(meter_id: int):
         }
         if cursor:
             variables["after"] = cursor
-        query = gql(
-            """
+        query = gql("""
         query WeeklyQuery($meterNumber: Int!,
                          $block: BlockFilter,
                          $first: Int!,
@@ -80,8 +79,7 @@ async def get_weekly(meter_id: int):
                 cursor
             }
         }
-        """
-        )
+        """)
         query.variable_values = variables
         result = await graphql.gql_query(query)
         items = result.get("meterDataPoints", [])
@@ -156,7 +154,7 @@ async def get_weekly(meter_id: int):
 
 
 @meter_router.get("/weeks/{year}", response_model=List[WeeksEnergyRead])
-async def get_weeks_of_year(meter_id: int, year: int):
+async def get_weeks_of_year(meter_id: int, year: int, request: Request):
     """
     Get energy usage of all weeks of specified year.
     """
@@ -207,7 +205,7 @@ async def get_weeks_of_year(meter_id: int, year: int):
             for w in range(1, total_weeks_in_year(year) + 1)
         ]
 
-    height, _ = latest_block.get_latest_block()
+    height, _ = await latest_block.get_latest_block(request=request)
 
     with Session(engine) as session:
         statement = select(WeeksEnergy).where(
@@ -343,11 +341,7 @@ async def get_weeks_of_year(meter_id: int, year: int):
 
 
 @meter_router.get("/month/{month}/{year}", response_model=List[MonthlyEnergyRead])
-async def get_month_of_year(
-    meter_id: int,
-    year: int,
-    month: int,
-):
+async def get_month_of_year(meter_id: int, year: int, month: int, request: Request):
     """
     Get daily energy usage for a given month in a specified year.
     """
@@ -381,7 +375,7 @@ async def get_month_of_year(
         start, end = month_range(y, m)
         return (end - start).days
 
-    height, _ = latest_block.get_latest_block()
+    height, _ = await latest_block.get_latest_block(request)
 
     with Session(engine) as session:
         stmt = select(MonthlyEnergy).where(
@@ -554,8 +548,7 @@ async def get_activities(meter_id: int, after: str | None = None, limit: int = 1
     if limit < 1:
         limit = 10
 
-    query = gql(
-        """
+    query = gql("""
         query ActivitiesQuery($meterNumber: Int!, $first: Int!, $after: String) {
 		    meterDataPoints(
 				meterNumber: $meterNumber,
@@ -572,8 +565,7 @@ async def get_activities(meter_id: int, after: str | None = None, limit: int = 1
 					}
 				}
 			  }
-		    }"""
-    )
+		    }""")
     query.variable_values = {"meterNumber": meter_id, "first": limit, " after": after}
 
     result = await graphql.gql_query(query)

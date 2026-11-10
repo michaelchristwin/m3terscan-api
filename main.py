@@ -7,11 +7,12 @@ from contextlib import asynccontextmanager
 from typing import Annotated, Any
 from dotenv import load_dotenv
 
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from sqlmodel import SQLModel
+import httpx
 
 from config import valkey_client
 from database import engine
@@ -31,9 +32,11 @@ async def lifespan(application: FastAPI):
     application.title = "M3terscan API"
     SQLModel.metadata.create_all(engine)
     await valkey_client.ValkeyManager.init()
+    app.state.http_client = httpx.AsyncClient(timeout=10.0)
 
     yield
     await valkey_client.ValkeyManager.close()
+    await app.state.http_client.aclose()
 
 
 origins = [
@@ -81,13 +84,14 @@ async def get_daily_batch(
     meter_ids: Annotated[
         list[int], Query(description="Repeat param: ?meter_ids=1&meter_ids=2")
     ],
+    request: Request,
 ) -> dict[str, Any]:
     """
     Get daily Batch
     """
 
     async def run_one(meter_id: int):
-        data = await get_daily_with_cache(meter_id)
+        data = await get_daily_with_cache(meter_id, request=request)
         return meter_id, data
 
     results = await asyncio.gather(*(run_one(mid) for mid in meter_ids))

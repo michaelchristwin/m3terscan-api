@@ -6,7 +6,7 @@ import datetime
 from collections import defaultdict
 from datetime import timedelta, timezone
 from typing import Dict, List, Optional, Sequence, Tuple
-
+from fastapi import Request
 from glide import Batch, ExpirySet, ExpiryType, GlideClient
 from gql import gql
 
@@ -165,8 +165,7 @@ class GraphQLDataFetcher:
             "after": cursor,
         }
 
-        query = gql(
-            """
+        query = gql("""
         query DailyQuery($meterNumber: Int!,
                          $block: BlockFilter,
                          $first: Int!,
@@ -186,8 +185,7 @@ class GraphQLDataFetcher:
                 cursor
             }
         }
-        """
-        )
+        """)
         query.variable_values = variables
 
         try:
@@ -225,7 +223,7 @@ class GraphQLDataFetcher:
         return dict(hourly_energy)
 
 
-async def get_daily_with_cache(meter_id: int) -> List[Dict]:
+async def get_daily_with_cache(meter_id: int, request: Request) -> List[Dict]:
     """Get daily energy usage aggregate with caching for completed hours."""
 
     vc = valkey_client.ValkeyManager.get_client()
@@ -236,7 +234,7 @@ async def get_daily_with_cache(meter_id: int) -> List[Dict]:
     date_str, current_hour, _ = time_manager.get_date_hour_info(now_utc)
     completed_hours = time_manager.get_completed_hours(current_hour)
 
-    height, timestamp = latest_block.get_latest_block()
+    height, timestamp = await latest_block.get_latest_block(request=request)
 
     if timestamp.tzinfo is None:
         timestamp = timestamp.replace(tzinfo=timezone.utc)
@@ -344,12 +342,12 @@ async def get_daily_with_cache(meter_id: int) -> List[Dict]:
 
 
 # Fallback function without cache (for error handling)
-async def get_daily_without_cache(m3ter_id: int):
+async def get_daily_without_cache(m3ter_id: int, request: Request):
     """
     Fallback function that uses the original implementation without caching.
     Use this if cache is unavailable or there are cache errors.
     """
-    height, timestamp = latest_block.get_latest_block()
+    height, timestamp = await latest_block.get_latest_block(request=request)
     if timestamp.tzinfo is None:
         timestamp = timestamp.replace(tzinfo=timezone.utc)
 
@@ -369,8 +367,7 @@ async def get_daily_without_cache(m3ter_id: int):
             "after": cursor,
         }
 
-        query = gql(
-            """
+        query = gql("""
             query DailyQuery(
               $meterNumber: Int!,
               $block: BlockFilter,
@@ -392,8 +389,7 @@ async def get_daily_without_cache(m3ter_id: int):
                 cursor
               }
             }
-            """
-        )
+            """)
         query.variable_values = variables
         result = await graphql.gql_query(query)
         items = result.get("meterDataPoints", [])
